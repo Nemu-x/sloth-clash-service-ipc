@@ -331,7 +331,7 @@ impl CoreManager {
 
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                let target = Path::new("/tmp/verge/verge-mihomo.sock");
+                let target = Path::new("/tmp/slothclash/sloth-mihomo.sock");
                 info!("Setting permissions for {:?}", target);
                 if !target.exists() {
                     warn!("{:?} does not exist, skipping permission setting", target);
@@ -351,7 +351,7 @@ impl CoreManager {
             use std::path::Path;
             use tokio::fs;
 
-            let target = Path::new("/tmp/verge/verge-mihomo.sock");
+            let target = Path::new("/tmp/slothclash/sloth-mihomo.sock");
             info!("Removing socket file {:?}", target);
             if !target.exists() {
                 info!("{:?} does not exist, no need to remove", target);

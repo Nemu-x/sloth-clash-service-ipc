@@ -1,8 +1,8 @@
 #![cfg(feature = "standalone")]
 #[cfg(test)]
 mod tests {
-    use clash_verge_service_ipc::{VERSION, run_ipc_server, stop_ipc_server};
-    use clash_verge_service_ipc::{connect, get_version};
+    use sloth_clash_service_ipc::{VERSION, run_ipc_server, stop_ipc_server};
+    use sloth_clash_service_ipc::{connect, get_version};
     use serial_test::serial;
     use tokio::time;
 
@@ -17,20 +17,20 @@ mod tests {
             let _ = stop_ipc_server().await;
 
             assert!(
-                !clash_verge_service_ipc::is_ipc_path_exists(),
+                !sloth_clash_service_ipc::is_ipc_path_exists(),
                 "IPC path should not exist after stopping the server"
             );
 
-            let ipc_path = Path::new(clash_verge_service_ipc::IPC_PATH);
+            let ipc_path = Path::new(sloth_clash_service_ipc::IPC_PATH);
             let _ = std::fs::create_dir(ipc_path.parent().unwrap());
             File::create(ipc_path).unwrap();
             assert!(
-                clash_verge_service_ipc::is_ipc_path_exists(),
+                sloth_clash_service_ipc::is_ipc_path_exists(),
                 "IPC path should exist after creating the file"
             );
 
             assert!(
-                clash_verge_service_ipc::is_reinstall_service_needed().await,
+                sloth_clash_service_ipc::is_reinstall_service_needed().await,
                 "Reinstall should be needed when IPC path exists but no server is running"
             );
             std::fs::remove_file(ipc_path).unwrap();

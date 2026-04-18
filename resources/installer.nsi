@@ -1,6 +1,6 @@
-OutFile "ClashVergeServiceInstaller.exe"
+OutFile "SlothClashServiceInstaller.exe"
 
-InstallDir "$PROGRAMFILES\ClashVergeService"
+InstallDir "$PROGRAMFILES\SlothClashService"
 
 Page directory
 Page instfiles
@@ -12,7 +12,7 @@ Section "Install"
 
     WriteUninstaller "$INSTDIR\Uninstall.exe"
 
-    ExecShell "" "$INSTDIR\clash-verge-service-install.exe"
+    ExecShell "" "$INSTDIR\sloth-clash-service-install.exe"
 SectionEnd
 
 Section "Uninstall"

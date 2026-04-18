@@ -1,7 +1,7 @@
 .PHONY: help test test_one test_all
 
 # configurable defaults
-RUST_LOG ?= clash_verge_service_ipc=trace,kode_bridge=error
+RUST_LOG ?= sloth_clash_service_ipc=trace,kode_bridge=error
 TEST_NAME ?= test_start_from_start
 CARGO ?= cargo
 CARGO_FLAGS ?= --all-features

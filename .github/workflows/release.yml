@@ -97,22 +97,22 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k github-actions github-actions.keychain
 
           echo "签名前验证架构:"
-          file target/${{ matrix.target }}/release/install-service
-          lipo -info target/${{ matrix.target }}/release/install-service || true
+          file target/${{ matrix.target }}/release/sloth-clash-service
+          lipo -info target/${{ matrix.target }}/release/sloth-clash-service || true
 
           # 对所有服务程序进行签名
-          for bin in clash-verge-service clash-verge-service-install clash-verge-service-uninstall; do
+          for bin in sloth-clash-service sloth-clash-service-install sloth-clash-service-uninstall; do
             codesign --force \
               -s "${{ secrets.APPLE_SIGNING_IDENTITY }}" \
               --keychain github-actions.keychain \
               --options runtime \
               --timestamp \
-              --identifier "io.github.clash-verge-rev.clash-verge-rev-service-ipc" \
+              --identifier "dev.slothclash.desktop.ipc" \
               target/${{ matrix.target }}/release/$bin
           done
 
           # 验证签名
-          for bin in clash-verge-service clash-verge-service-install clash-verge-service-uninstall; do
+          for bin in sloth-clash-service sloth-clash-service-install sloth-clash-service-uninstall; do
             codesign -dvv target/${{ matrix.target }}/release/$bin
             codesign -d --entitlements /dev/stdout target/${{ matrix.target }}/release/$bin
           done
@@ -125,9 +125,9 @@ jobs:
           tag_name: ${{ matrix.target }}
           token: ${{ secrets.GITHUB_TOKEN }}
           files: |
-            target/${{ matrix.target }}/release/clash-verge-service.exe
-            target/${{ matrix.target }}/release/clash-verge-service-install.exe
-            target/${{ matrix.target }}/release/clash-verge-service-uninstall.exe
+            target/${{ matrix.target }}/release/sloth-clash-service.exe
+            target/${{ matrix.target }}/release/sloth-clash-service-install.exe
+            target/${{ matrix.target }}/release/sloth-clash-service-uninstall.exe
 
       - name: Release
         if: matrix.os != 'windows-latest'
@@ -137,6 +137,6 @@ jobs:
           tag_name: ${{ matrix.target }}
           token: ${{ secrets.GITHUB_TOKEN }}
           files: |
-            target/${{ matrix.target }}/release/clash-verge-service
-            target/${{ matrix.target }}/release/clash-verge-service-install
-            target/${{ matrix.target }}/release/clash-verge-service-uninstall
+            target/${{ matrix.target }}/release/sloth-clash-service
+            target/${{ matrix.target }}/release/sloth-clash-service-install
+            target/${{ matrix.target }}/release/sloth-clash-service-uninstall

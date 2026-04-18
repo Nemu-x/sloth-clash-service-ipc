@@ -1,26 +1,26 @@
 [package]
-name = "clash_verge_service_ipc"
+name = "sloth_clash_service_ipc"
 version = "2.2.0"
 edition = "2024"
 authors = ["Tunglies"]
 license = "GPL-3.0"
 
 [lib]
-name = "clash_verge_service_ipc"
+name = "sloth_clash_service_ipc"
 path = "src/lib.rs"
 
 [[bin]]
-name = "clash-verge-service"
+name = "sloth-clash-service"
 path = "src/bin/service.rs"
 required-features = ["standalone"]
 
 [[bin]]
-name = "clash-verge-service-install"
+name = "sloth-clash-service-install"
 path = "src/bin/install_service.rs"
 required-features = ["standalone"]
 
 [[bin]]
-name = "clash-verge-service-uninstall"
+name = "sloth-clash-service-uninstall"
 path = "src/bin/uninstall_service.rs"
 required-features = ["standalone"]
 

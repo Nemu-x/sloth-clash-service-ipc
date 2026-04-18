@@ -14,7 +14,7 @@ fn env_u32(key: &str) -> Option<u32> {
 fn resolve_service_group_name() -> String {
     use nix::unistd::{Gid, Group, Uid, User};
 
-    if let Some(gid) = env_u32("CLASH_VERGE_SERVICE_GID")
+    if let Some(gid) = env_u32("SLOTH_CLASH_SERVICE_GID")
         && let Ok(Some(group)) = Group::from_gid(Gid::from_raw(gid))
     {
         return group.name;
@@ -48,15 +48,15 @@ fn main() -> Result<(), Error> {
 
     let service_binary_path = env::current_exe()
         .unwrap()
-        .with_file_name("clash-verge-service");
+        .with_file_name("sloth-clash-service");
 
     if !service_binary_path.exists() {
-        return Err(anyhow::anyhow!("clash-verge-service binary not found"));
+        return Err(anyhow::anyhow!("sloth-clash-service binary not found"));
     }
 
     // 定义 bundle 路径
     let bundle_path =
-        "/Library/PrivilegedHelperTools/io.github.clash-verge-rev.clash-verge-rev.service.bundle";
+        "/Library/PrivilegedHelperTools/dev.slothclash.desktop.ipc.service.bundle";
     let contents_path = format!("{}/Contents", bundle_path);
     let macos_path = format!("{}/MacOS", contents_path);
 
@@ -65,7 +65,7 @@ fn main() -> Result<(), Error> {
         .map_err(|e| anyhow::anyhow!("Failed to create bundle directories: {}", e))?;
 
     // 复制二进制文件到 bundle 的 MacOS 目录
-    let target_binary_path = format!("{}/clash-verge-service", macos_path);
+    let target_binary_path = format!("{}/sloth-clash-service", macos_path);
     std::fs::copy(&service_binary_path, &target_binary_path)
         .map_err(|e| anyhow::anyhow!("Failed to copy service file: {}", e))?;
 
@@ -84,8 +84,7 @@ fn main() -> Result<(), Error> {
     }
 
     // 创建并写入 launchd plist
-    let plist_file =
-        "/Library/LaunchDaemons/io.github.clash-verge-rev.clash-verge-rev.service.plist";
+    let plist_file = "/Library/LaunchDaemons/dev.slothclash.desktop.ipc.service.plist";
     let plist_file = Path::new(plist_file);
 
     let launchd_plist_content = format!(
@@ -119,7 +118,7 @@ fn main() -> Result<(), Error> {
         "launchctl",
         &[
             "enable",
-            "system/io.github.clash-verge-rev.clash-verge-rev.service",
+            "system/dev.slothclash.desktop.ipc.service",
         ],
         debug,
     );
@@ -135,7 +134,7 @@ fn main() -> Result<(), Error> {
     );
     let _ = run_command(
         "launchctl",
-        &["start", "io.github.clash-verge-rev.clash-verge-rev.service"],
+        &["start", "dev.slothclash.desktop.ipc.service"],
         debug,
     );
 
@@ -144,7 +143,7 @@ fn main() -> Result<(), Error> {
 
 #[cfg(target_os = "linux")]
 fn main() -> Result<(), Error> {
-    const SERVICE_NAME: &str = "clash-verge-service";
+    const SERVICE_NAME: &str = "sloth-clash-service";
     use std::env;
     use std::fs::File;
     use std::io::Write;
@@ -154,10 +153,10 @@ fn main() -> Result<(), Error> {
 
     let service_binary_path = env::current_exe()
         .unwrap()
-        .with_file_name("clash-verge-service");
+        .with_file_name("sloth-clash-service");
 
     if !service_binary_path.exists() {
-        return Err(anyhow::anyhow!("clash-verge-service binary not found"));
+        return Err(anyhow::anyhow!("sloth-clash-service binary not found"));
     }
 
     // Check service status
@@ -218,7 +217,7 @@ fn main() -> anyhow::Result<()> {
     let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
 
     let service_access = ServiceAccess::QUERY_STATUS | ServiceAccess::START;
-    if let Ok(service) = service_manager.open_service("clash_verge_service", service_access)
+    if let Ok(service) = service_manager.open_service("sloth_clash_service", service_access)
         && let Ok(status) = service.query_status()
     {
         match status.current_state {
@@ -236,16 +235,16 @@ fn main() -> anyhow::Result<()> {
 
     let service_binary_path = env::current_exe()
         .unwrap()
-        .with_file_name("clash-verge-service.exe");
+        .with_file_name("sloth-clash-service.exe");
 
     if !service_binary_path.exists() {
-        eprintln!("clash-verge-service.exe not found");
+        eprintln!("sloth-clash-service.exe not found");
         std::process::exit(2);
     }
 
     let service_info = ServiceInfo {
-        name: OsString::from("clash_verge_service"),
-        display_name: OsString::from("Clash Verge Service"),
+        name: OsString::from("sloth_clash_service"),
+        display_name: OsString::from("Sloth Clash Service"),
         service_type: ServiceType::OWN_PROCESS,
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
@@ -259,7 +258,7 @@ fn main() -> anyhow::Result<()> {
     let start_access = ServiceAccess::CHANGE_CONFIG | ServiceAccess::START;
     let service = service_manager.create_service(&service_info, start_access)?;
 
-    service.set_description("Clash Verge Service helps to launch clash core")?;
+    service.set_description("Sloth Clash Service — IPC helper for Sloth Clash / mihomo.")?;
     service.start(&Vec::<&OsStr>::new())?;
 
     Ok(())

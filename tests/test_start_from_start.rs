@@ -3,7 +3,7 @@ mod common;
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
-    use clash_verge_service_ipc::{
+    use sloth_clash_service_ipc::{
         ClashConfig, CoreConfig, connect, run_ipc_server, start_clash, stop_ipc_server,
     };
     use std::sync::OnceLock;
