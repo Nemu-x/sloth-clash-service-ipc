@@ -1,6 +1,6 @@
 #![cfg(feature = "client")]
 
-use clash_verge_service_ipc::{
+use sloth_clash_service_ipc::{
     ClashConfig, CoreConfig, WriterConfig, connect, start_clash, stop_clash, stop_ipc_server,
 };
 use std::process::{Command, Stdio};

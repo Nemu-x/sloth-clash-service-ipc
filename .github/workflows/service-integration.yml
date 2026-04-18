@@ -29,11 +29,11 @@ jobs:
 
       - name: Install service (Linux)
         if: runner.os == 'Linux'
-        run: sudo target/release/clash-verge-service-install --debug
+        run: sudo target/release/sloth-clash-service-install --debug
 
       - name: Verify service (Linux)
         if: runner.os == 'Linux'
-        run: sudo systemctl is-active clash-verge-service.service
+        run: sudo systemctl is-active sloth-clash-service.service
 
       - name: Run mock_binary (Linux)
         if: runner.os == 'Linux'
@@ -48,15 +48,15 @@ jobs:
 
       - name: Uninstall service (Linux)
         if: runner.os == 'Linux'
-        run: sudo target/release/clash-verge-service-uninstall --debug
+        run: sudo target/release/sloth-clash-service-uninstall --debug
 
       - name: Install service (macOS)
         if: runner.os == 'macOS'
-        run: sudo target/release/clash-verge-service-install --debug
+        run: sudo target/release/sloth-clash-service-install --debug
 
       - name: Verify service (macOS)
         if: runner.os == 'macOS'
-        run: sudo launchctl list | grep io.github.clash-verge-rev.clash-verge-rev.service
+        run: sudo launchctl list | grep dev.slothclash.desktop.ipc.service
 
       - name: Run mock_binary (macOS)
         if: runner.os == 'macOS'
@@ -71,20 +71,20 @@ jobs:
 
       - name: Uninstall service (macOS)
         if: runner.os == 'macOS'
-        run: sudo target/release/clash-verge-service-uninstall --debug
+        run: sudo target/release/sloth-clash-service-uninstall --debug
 
       - name: Install service (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          & "$env:GITHUB_WORKSPACE\\target\\release\\clash-verge-service-install.exe"
+          & "$env:GITHUB_WORKSPACE\\target\\release\\sloth-clash-service-install.exe"
           Start-Sleep -Seconds 2
 
       - name: Verify service (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $state = sc query clash_verge_service | Select-String "STATE"
+          $state = sc query sloth_clash_service | Select-String "STATE"
           if ($state -notmatch "RUNNING") { exit 1 }
 
       - name: Run mock_binary (Windows)
@@ -105,4 +105,4 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          & "$env:GITHUB_WORKSPACE\\target\\release\\clash-verge-service-uninstall.exe"
+          & "$env:GITHUB_WORKSPACE\\target\\release\\sloth-clash-service-uninstall.exe"

@@ -2,7 +2,7 @@
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
-    use clash_verge_service_ipc::{IPC_PATH, IpcCommand, run_ipc_server, stop_ipc_server};
+    use sloth_clash_service_ipc::{IPC_PATH, IpcCommand, run_ipc_server, stop_ipc_server};
     use kode_bridge::IpcHttpClient;
     use serial_test::serial;
     #[cfg(unix)]

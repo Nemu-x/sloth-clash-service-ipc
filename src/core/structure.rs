@@ -34,9 +34,9 @@ pub struct Response<T> {
 impl Default for CoreConfig {
     fn default() -> Self {
         let core_ipc_path = if cfg!(windows) {
-            r"\\.\pipe\verge-mihomo".to_string()
+            r"\\.\pipe\sloth-mihomo".to_string()
         } else {
-            "/tmp/verge-mihomo.sock".to_string()
+            "/tmp/slothclash/sloth-mihomo.sock".to_string()
         };
         Self {
             core_path: "./clash".to_string(),
