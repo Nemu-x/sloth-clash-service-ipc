@@ -1,11 +1,16 @@
+# Builds standalone service binaries and publishes one GitHub Release per Rust
+# target triple (e.g. x86_64-pc-windows-msvc). SlothClash prebuild downloads from:
+# https://github.com/<owner>/sloth-clash-service-ipc/releases/download/<triple>/sloth-clash-service.exe
 name: Release CI
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - 'v*.*.*'
-permissions: write-all
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
 
 jobs:
   release-update:
@@ -35,9 +40,12 @@ jobs:
             arch: x86_64
 
     runs-on: ${{ matrix.os }}
+    concurrency:
+      group: sloth-service-ipc-${{ github.ref }}-${{ matrix.target }}
+      cancel-in-progress: true
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Install Rust
         if: matrix.os != 'ubuntu-latest'
