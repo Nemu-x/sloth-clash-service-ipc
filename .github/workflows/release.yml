@@ -1,6 +1,10 @@
 # Builds standalone service binaries and publishes one GitHub Release per Rust
 # target triple (e.g. x86_64-pc-windows-msvc). SlothClash prebuild downloads from:
 # https://github.com/<owner>/sloth-clash-service-ipc/releases/download/<triple>/sloth-clash-service.exe
+#
+# Do not use a separate "update tag" action: it hits PATCH /git/refs and often fails with
+# "Resource not accessible by integration" under default GITHUB_TOKEN / org policies.
+# action-gh-release creates the per-triple tag when publishing assets (needs contents:write).
 name: Release CI
 
 on:
@@ -14,6 +18,8 @@ permissions:
 
 jobs:
   release-update:
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -85,13 +91,6 @@ jobs:
         with:
           target: ${{ matrix.target }}
           features: standalone
-
-      - name: Update Tag
-        uses: richardsimko/update-tag@v1
-        with:
-          tag_name: ${{ matrix.target }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # secrets cannot be used in step `if:` on some validators; branch inside the shell instead.
       # Optional repo secrets: APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY.
