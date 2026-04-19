@@ -93,10 +93,15 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: CodeSign
-        if: startsWith(matrix.os, 'macos')
+      # Without repo secrets, base64 decode yields an empty .p12 and `security import` fails.
+      # Set APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY for notarized-style signing.
+      - name: CodeSign (Developer ID)
+        if: >
+          startsWith(matrix.os, 'macos') &&
+          secrets.APPLE_CERTIFICATE != '' &&
+          secrets.APPLE_SIGNING_IDENTITY != ''
         run: |
-          # 设置证书
+          set -euo pipefail
           echo "${{ secrets.APPLE_CERTIFICATE }}" | base64 --decode > cert.p12
           security create-keychain -p github-actions github-actions.keychain
           security default-keychain -s github-actions.keychain
@@ -104,11 +109,10 @@ jobs:
           security import cert.p12 -k github-actions.keychain -P "${{ secrets.APPLE_CERTIFICATE_PASSWORD }}" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k github-actions github-actions.keychain
 
-          echo "签名前验证架构:"
-          file target/${{ matrix.target }}/release/sloth-clash-service
-          lipo -info target/${{ matrix.target }}/release/sloth-clash-service || true
+          echo "Pre-sign binary check:"
+          file "target/${{ matrix.target }}/release/sloth-clash-service"
+          lipo -info "target/${{ matrix.target }}/release/sloth-clash-service" || true
 
-          # 对所有服务程序进行签名
           for bin in sloth-clash-service sloth-clash-service-install sloth-clash-service-uninstall; do
             codesign --force \
               -s "${{ secrets.APPLE_SIGNING_IDENTITY }}" \
@@ -116,14 +120,26 @@ jobs:
               --options runtime \
               --timestamp \
               --identifier "dev.slothclash.desktop.ipc" \
-              target/${{ matrix.target }}/release/$bin
+              "target/${{ matrix.target }}/release/$bin"
           done
 
-          # 验证签名
           for bin in sloth-clash-service sloth-clash-service-install sloth-clash-service-uninstall; do
-            codesign -dvv target/${{ matrix.target }}/release/$bin
-            codesign -d --entitlements /dev/stdout target/${{ matrix.target }}/release/$bin
+            codesign -dvv "target/${{ matrix.target }}/release/$bin"
           done
+
+      - name: Ad-hoc codesign (no Apple signing secrets)
+        if: >
+          startsWith(matrix.os, 'macos') &&
+          (secrets.APPLE_CERTIFICATE == '' || secrets.APPLE_SIGNING_IDENTITY == '')
+        run: |
+          set -euo pipefail
+          echo "APPLE_CERTIFICATE / APPLE_SIGNING_IDENTITY not set — using ad-hoc codesign (-s -)."
+          for bin in sloth-clash-service sloth-clash-service-install sloth-clash-service-uninstall; do
+            codesign --force -s - \
+              --identifier "dev.slothclash.desktop.ipc" \
+              "target/${{ matrix.target }}/release/$bin"
+          done
+          codesign -dv --verbose=4 "target/${{ matrix.target }}/release/sloth-clash-service" 2>&1 | head -20
 
       - name: Release
         if: matrix.os == 'windows-latest'
