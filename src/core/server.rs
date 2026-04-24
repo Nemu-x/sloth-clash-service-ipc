@@ -109,38 +109,33 @@ async fn make_ipc_dir() -> Result<()> {
             fs::create_dir_all(dir_path).await?;
         }
 
-        #[cfg(target_os = "macos")]
-        {
-            // macOS desktop process must always be able to traverse /tmp/slothclash;
-            // restrictive group modes (e.g. 2770 root:wheel) can deny access and break IPC.
-            // Sticky world-writable temp dir mirrors /tmp semantics and survives service restarts.
-            fs::set_permissions(dir_path, Permissions::from_mode(0o1777)).await?;
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            // Linux path keeps group-based access for service/user interoperability.
-            let gid = std::env::var("SUDO_GID")
-                .ok()
-                .and_then(|s| s.parse::<platform_lib::gid_t>().ok())
-                .unwrap_or_else(|| unsafe { platform_lib::getgid() });
+        // We need to ensure compatibility with sudo GID through the terminal
+        let gid = std::env::var("SUDO_GID")
+            .ok()
+            .and_then(|s| s.parse::<platform_lib::gid_t>().ok())
+            .unwrap_or_else(|| unsafe { platform_lib::getgid() });
 
-            if let Ok(c_path) = std::ffi::CString::new(dir_path.to_string_lossy().as_bytes()) {
-                unsafe {
-                    if platform_lib::chown(c_path.as_ptr(), platform_lib::uid_t::MAX, gid) != 0 {
-                        let err = std::io::Error::last_os_error();
-                        log::warn!(
-                            "Failed to chown directory {:?} to gid {}: {}",
-                            dir_path,
-                            gid,
-                            err
-                        );
-                    }
+        if let Ok(c_path) = std::ffi::CString::new(dir_path.to_string_lossy().as_bytes()) {
+            unsafe {
+                if platform_lib::chown(c_path.as_ptr(), platform_lib::uid_t::MAX, gid) != 0 {
+                    let err = std::io::Error::last_os_error();
+                    log::warn!(
+                        "Failed to chown directory {:?} to gid {}: {}",
+                        dir_path,
+                        gid,
+                        err
+                    );
                 }
             }
-
-            // See issues in https://github.com/clash-verge-rev/clash-verge-rev/issues/6149
-            fs::set_permissions(dir_path, Permissions::from_mode(0o2770)).await?;
         }
+
+        // See issues in https://github.com/clash-verge-rev/clash-verge-rev/issues/6149
+        // Apply the SetGID bit (0o2000) to ensure the IPC socket inherits the directory's group ID.
+        // The mode is set to 0o2770 (rwxrws---) to permit the designated user group (e.g., staff
+        // on macOS or the primary group on Linux) to manage the socket's lifecycle. This prevents
+        // permission denied errors when the GUI process, running with non-root privileges,
+        // attempts to recreate the socket during service initialization or sidecar fallbacks.
+        fs::set_permissions(dir_path, Permissions::from_mode(0o2770)).await?;
     }
     #[cfg(windows)]
     {
@@ -226,9 +221,6 @@ pub fn spawn_socket_dir_watchdog() {
                 }
                 use std::fs::Permissions;
                 use std::os::unix::fs::PermissionsExt;
-                #[cfg(target_os = "macos")]
-                let _ = tokio::fs::set_permissions(dir, Permissions::from_mode(0o1777)).await;
-                #[cfg(not(target_os = "macos"))]
                 let _ = tokio::fs::set_permissions(dir, Permissions::from_mode(0o777)).await;
                 info!("IPC socket directory {:?} recreated", dir);
             }
