@@ -1,25 +1,14 @@
-# Builds standalone service binaries and publishes one GitHub Release per Rust
-# target triple (e.g. x86_64-pc-windows-msvc). SlothClash prebuild downloads from:
-# https://github.com/<owner>/sloth-clash-service-ipc/releases/download/<triple>/sloth-clash-service.exe
-#
-# Do not use a separate "update tag" action: it hits PATCH /git/refs and often fails with
-# "Resource not accessible by integration" under default GITHUB_TOKEN / org policies.
-# action-gh-release creates the per-triple tag when publishing assets (needs contents:write).
 name: Release CI
 
 on:
   workflow_dispatch:
   push:
-    tags:
-      - 'v*'
-
-permissions:
-  contents: write
+    branches:
+      - 'v*.*.*'
+permissions: write-all
 
 jobs:
   release-update:
-    permissions:
-      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -46,12 +35,9 @@ jobs:
             arch: x86_64
 
     runs-on: ${{ matrix.os }}
-    concurrency:
-      group: sloth-service-ipc-${{ github.ref }}-${{ matrix.target }}
-      cancel-in-progress: true
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust
         if: matrix.os != 'ubuntu-latest'
@@ -92,52 +78,44 @@ jobs:
           target: ${{ matrix.target }}
           features: standalone
 
-      # secrets cannot be used in step `if:` on some validators; branch inside the shell instead.
-      # Optional repo secrets: APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY.
-      - name: CodeSign macOS
-        if: startsWith(matrix.os, 'macos')
+      - name: Update Tag
+        uses: richardsimko/update-tag@v1
+        with:
+          tag_name: ${{ matrix.target }}
         env:
-          APPLE_CERTIFICATE_B64: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: CodeSign
+        if: startsWith(matrix.os, 'macos')
         run: |
-          set -euo pipefail
-          TGT="${{ matrix.target }}"
-          if [ -n "${APPLE_CERTIFICATE_B64}" ] && [ -n "${APPLE_SIGNING_IDENTITY}" ]; then
-            echo "Developer ID codesign (repo secrets present)."
-            echo "${APPLE_CERTIFICATE_B64}" | base64 --decode > cert.p12
-            security create-keychain -p github-actions github-actions.keychain
-            security default-keychain -s github-actions.keychain
-            security unlock-keychain -p github-actions github-actions.keychain
-            security import cert.p12 -k github-actions.keychain -P "${APPLE_CERTIFICATE_PASSWORD}" -T /usr/bin/codesign
-            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k github-actions github-actions.keychain
+          # 设置证书
+          echo "${{ secrets.APPLE_CERTIFICATE }}" | base64 --decode > cert.p12
+          security create-keychain -p github-actions github-actions.keychain
+          security default-keychain -s github-actions.keychain
+          security unlock-keychain -p github-actions github-actions.keychain
+          security import cert.p12 -k github-actions.keychain -P "${{ secrets.APPLE_CERTIFICATE_PASSWORD }}" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k github-actions github-actions.keychain
 
-            echo "Pre-sign binary check:"
-            file "target/${TGT}/release/sloth-clash-service"
-            lipo -info "target/${TGT}/release/sloth-clash-service" || true
+          echo "签名前验证架构:"
+          file target/${{ matrix.target }}/release/sloth-clash-service
+          lipo -info target/${{ matrix.target }}/release/sloth-clash-service || true
 
-            for bin in sloth-clash-service sloth-clash-service-install sloth-clash-service-uninstall; do
-              codesign --force \
-                -s "${APPLE_SIGNING_IDENTITY}" \
-                --keychain github-actions.keychain \
-                --options runtime \
-                --timestamp \
-                --identifier "dev.slothclash.desktop.ipc" \
-                "target/${TGT}/release/$bin"
-            done
+          # 对所有服务程序进行签名
+          for bin in sloth-clash-service sloth-clash-service-install sloth-clash-service-uninstall; do
+            codesign --force \
+              -s "${{ secrets.APPLE_SIGNING_IDENTITY }}" \
+              --keychain github-actions.keychain \
+              --options runtime \
+              --timestamp \
+              --identifier "dev.slothclash.desktop.ipc" \
+              target/${{ matrix.target }}/release/$bin
+          done
 
-            for bin in sloth-clash-service sloth-clash-service-install sloth-clash-service-uninstall; do
-              codesign -dvv "target/${TGT}/release/$bin"
-            done
-          else
-            echo "No APPLE_CERTIFICATE / APPLE_SIGNING_IDENTITY — ad-hoc codesign (-s -)."
-            for bin in sloth-clash-service sloth-clash-service-install sloth-clash-service-uninstall; do
-              codesign --force -s - \
-                --identifier "dev.slothclash.desktop.ipc" \
-                "target/${TGT}/release/$bin"
-            done
-            codesign -dv --verbose=4 "target/${TGT}/release/sloth-clash-service" 2>&1 | head -20
-          fi
+          # 验证签名
+          for bin in sloth-clash-service sloth-clash-service-install sloth-clash-service-uninstall; do
+            codesign -dvv target/${{ matrix.target }}/release/$bin
+            codesign -d --entitlements /dev/stdout target/${{ matrix.target }}/release/$bin
+          done
 
       - name: Release
         if: matrix.os == 'windows-latest'
