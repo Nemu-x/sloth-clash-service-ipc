@@ -129,12 +129,14 @@ async fn make_ipc_dir() -> Result<()> {
             }
         }
 
-        // See issues in https://github.com/clash-verge-rev/clash-verge-rev/issues/6149
-        // Apply the SetGID bit (0o2000) to ensure the IPC socket inherits the directory's group ID.
-        // The mode is set to 0o2770 (rwxrws---) to permit the designated user group (e.g., staff
-        // on macOS or the primary group on Linux) to manage the socket's lifecycle. This prevents
-        // permission denied errors when the GUI process, running with non-root privileges,
-        // attempts to recreate the socket during service initialization or sidecar fallbacks.
+        // macOS app connects as an unprivileged GUI user through /tmp.
+        // Keep the socket directory world-traversable with sticky bit to avoid
+        // recurring "permission denied" after reboot (which forces osascript/admin prompt).
+        #[cfg(target_os = "macos")]
+        fs::set_permissions(dir_path, Permissions::from_mode(0o1777)).await?;
+
+        // Linux keeps group-managed semantics for the service/user group pair.
+        #[cfg(not(target_os = "macos"))]
         fs::set_permissions(dir_path, Permissions::from_mode(0o2770)).await?;
     }
     #[cfg(windows)]
@@ -221,6 +223,9 @@ pub fn spawn_socket_dir_watchdog() {
                 }
                 use std::fs::Permissions;
                 use std::os::unix::fs::PermissionsExt;
+                #[cfg(target_os = "macos")]
+                let _ = tokio::fs::set_permissions(dir, Permissions::from_mode(0o1777)).await;
+                #[cfg(not(target_os = "macos"))]
                 let _ = tokio::fs::set_permissions(dir, Permissions::from_mode(0o777)).await;
                 info!("IPC socket directory {:?} recreated", dir);
             }
