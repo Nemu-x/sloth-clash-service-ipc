@@ -212,25 +212,45 @@ fn main() -> anyhow::Result<()> {
     };
     use std::env;
     use std::ffi::{OsStr, OsString};
+    use std::time::Duration;
 
     let manager_access = ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE;
     let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
 
-    let service_access = ServiceAccess::QUERY_STATUS | ServiceAccess::START;
-    if let Ok(service) = service_manager.open_service("sloth_clash_service", service_access)
-        && let Ok(status) = service.query_status()
-    {
-        match status.current_state {
-            ServiceState::StopPending
-            | ServiceState::Stopped
-            | ServiceState::PausePending
-            | ServiceState::Paused => {
-                service.start(&Vec::<&OsStr>::new())?;
+    // Idempotent, self-healing install: if a service already exists (possibly an
+    // older, vulnerable build), stop and delete it, then recreate from this binary.
+    // This is how a fixed version replaces a shipped-vulnerable one on upgrade.
+    let manage_access =
+        ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
+    if let Ok(service) = service_manager.open_service("sloth_clash_service", manage_access) {
+        if let Ok(status) = service.query_status()
+            && status.current_state != ServiceState::Stopped
+        {
+            let _ = service.stop();
+            for _ in 0..20 {
+                std::thread::sleep(Duration::from_millis(250));
+                match service.query_status() {
+                    Ok(s) if s.current_state == ServiceState::Stopped => break,
+                    _ => {}
+                }
             }
-            _ => {}
-        };
+        }
 
-        return Ok(());
+        let _ = service.delete();
+        drop(service);
+
+        // The SCM removes the record only once the last handle closes; wait until a
+        // fresh open fails so the subsequent create_service does not hit
+        // ERROR_SERVICE_MARKED_FOR_DELETE.
+        for _ in 0..40 {
+            if service_manager
+                .open_service("sloth_clash_service", ServiceAccess::QUERY_STATUS)
+                .is_err()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
     }
 
     let service_binary_path = env::current_exe()
