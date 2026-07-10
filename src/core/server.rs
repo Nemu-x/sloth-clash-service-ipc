@@ -53,7 +53,16 @@ pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
             use tokio::fs;
 
             tokio::time::sleep(Duration::from_millis(50)).await;
+            // Layer-2 socket hardening. Linux: root-owned, group-accessible via the
+            // setgid parent dir (0o660) — the non-admin GUI works through group
+            // membership without world exposure. macOS: keep the original
+            // world-accessible mode; the GUI connects through /tmp and group-scoping
+            // there caused a reboot admin-prompt loop (base commit 6a63cda). The real
+            // macOS boundary is Layer-3 caller auth (SecCode), not socket perms.
+            #[cfg(target_os = "macos")]
             fs::set_permissions(IPC_PATH, Permissions::from_mode(0o777)).await?;
+            #[cfg(not(target_os = "macos"))]
+            fs::set_permissions(IPC_PATH, Permissions::from_mode(0o660)).await?;
 
             spawn_socket_dir_watchdog();
         }
@@ -223,10 +232,14 @@ pub fn spawn_socket_dir_watchdog() {
                 }
                 use std::fs::Permissions;
                 use std::os::unix::fs::PermissionsExt;
+                // Layer-2: Linux is group-scoped (setgid) instead of world-writable.
+                // macOS keeps 1777 (sticky world dir): the non-admin GUI connects
+                // through /tmp and group-scoping there caused a reboot admin-prompt
+                // loop (base commit 6a63cda). Real macOS boundary = Layer-3 SecCode.
                 #[cfg(target_os = "macos")]
                 let _ = tokio::fs::set_permissions(dir, Permissions::from_mode(0o1777)).await;
                 #[cfg(not(target_os = "macos"))]
-                let _ = tokio::fs::set_permissions(dir, Permissions::from_mode(0o777)).await;
+                let _ = tokio::fs::set_permissions(dir, Permissions::from_mode(0o2770)).await;
                 info!("IPC socket directory {:?} recreated", dir);
             }
         }
@@ -257,7 +270,14 @@ fn create_ipc_server() -> Result<IpcHttpServer> {
 
     #[cfg(windows)]
     {
-        let server = server.with_listener_security_descriptor("D:(A;;GA;;;WD)");
+        // Layer-2 hardening (NOT a trust boundary — a same-user attacker shares the
+        // GUI's SID). Upstream clash-verge-service-ipc uses `D:(A;;GA;;;WD)` (World).
+        // Narrow to SYSTEM + Administrators (full) and Authenticated Users, dropping
+        // ANONYMOUS LOGON and other non-authenticated principals. The legitimate
+        // non-admin GUI runs as an authenticated interactive user and keeps access.
+        // A malformed SDDL makes kode-bridge panic at startup (fails closed).
+        let server =
+            server.with_listener_security_descriptor("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;AU)");
         Ok(server)
     }
 }

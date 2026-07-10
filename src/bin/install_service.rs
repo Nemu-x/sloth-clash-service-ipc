@@ -5,6 +5,43 @@ fn main() {
 
 use anyhow::Error;
 
+/// Parse `--core-sha256 <hex,hex;...>` (or `--core-sha256=<...>`) from argv and
+/// return a normalized, comma-joined list of valid 64-char SHA-256 hex strings, or
+/// `None` if the flag is absent or has no valid hashes. When `None`, nothing is
+/// persisted and the service falls back to the admin-only location allow-list.
+/// The persisted value is read by the service from its own environment
+/// (`SLOTH_CLASH_CORE_SHA256`); the accepted format mirrors `security.rs`.
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+fn parse_core_sha256() -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut raw: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if let Some(v) = a.strip_prefix("--core-sha256=") {
+            raw = Some(v.to_string());
+        } else if a == "--core-sha256" {
+            if let Some(v) = args.get(i + 1) {
+                raw = Some(v.clone());
+            }
+            i += 1;
+        }
+        i += 1;
+    }
+
+    let hashes: Vec<String> = raw?
+        .split([',', ';', ' ', '\t'])
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .collect();
+
+    if hashes.is_empty() {
+        None
+    } else {
+        Some(hashes.join(","))
+    }
+}
+
 #[cfg(unix)]
 fn env_u32(key: &str) -> Option<u32> {
     std::env::var(key).ok()?.parse().ok()
@@ -87,9 +124,20 @@ fn main() -> Result<(), Error> {
     let plist_file = "/Library/LaunchDaemons/dev.slothclash.desktop.ipc.service.plist";
     let plist_file = Path::new(plist_file);
 
+    // Persist the core content pin into the daemon's environment via the plist's
+    // EnvironmentVariables dict (empty when no pin was supplied).
+    let env_block = match parse_core_sha256() {
+        Some(pin) => format!(
+            "    <key>EnvironmentVariables</key>\n    <dict>\n        \
+             <key>SLOTH_CLASH_CORE_SHA256</key>\n        <string>{pin}</string>\n    </dict>\n\n"
+        ),
+        None => String::new(),
+    };
+
     let launchd_plist_content = format!(
         include_str!("../../resources/launchd.plist.tmpl"),
-        group_name = resolve_service_group_name()
+        group_name = resolve_service_group_name(),
+        env_block = env_block,
     );
 
     File::create(plist_file)
@@ -183,10 +231,18 @@ fn main() -> Result<(), Error> {
     let unit_file = format!("/etc/systemd/system/{}.service", SERVICE_NAME);
     let unit_file = Path::new(&unit_file);
 
+    // Persist the core content pin into the service environment via a systemd
+    // `Environment=` line (empty when no pin was supplied).
+    let env_line = match parse_core_sha256() {
+        Some(pin) => format!("Environment=SLOTH_CLASH_CORE_SHA256={pin}\n"),
+        None => String::new(),
+    };
+
     let unit_file_content = format!(
         include_str!("../../resources/systemd_service_unit.tmpl"),
         exec_start = service_binary_path.to_str().unwrap(),
-        group = resolve_service_group_name()
+        group = resolve_service_group_name(),
+        env_line = env_line,
     );
 
     File::create(unit_file)
@@ -212,25 +268,45 @@ fn main() -> anyhow::Result<()> {
     };
     use std::env;
     use std::ffi::{OsStr, OsString};
+    use std::time::Duration;
 
     let manager_access = ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE;
     let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
 
-    let service_access = ServiceAccess::QUERY_STATUS | ServiceAccess::START;
-    if let Ok(service) = service_manager.open_service("sloth_clash_service", service_access)
-        && let Ok(status) = service.query_status()
-    {
-        match status.current_state {
-            ServiceState::StopPending
-            | ServiceState::Stopped
-            | ServiceState::PausePending
-            | ServiceState::Paused => {
-                service.start(&Vec::<&OsStr>::new())?;
+    // Idempotent, self-healing install: if a service already exists (possibly an
+    // older, vulnerable build), stop and delete it, then recreate from this binary.
+    // This is how a fixed version replaces a shipped-vulnerable one on upgrade.
+    let manage_access =
+        ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
+    if let Ok(service) = service_manager.open_service("sloth_clash_service", manage_access) {
+        if let Ok(status) = service.query_status()
+            && status.current_state != ServiceState::Stopped
+        {
+            let _ = service.stop();
+            for _ in 0..20 {
+                std::thread::sleep(Duration::from_millis(250));
+                match service.query_status() {
+                    Ok(s) if s.current_state == ServiceState::Stopped => break,
+                    _ => {}
+                }
             }
-            _ => {}
-        };
+        }
 
-        return Ok(());
+        let _ = service.delete();
+        drop(service);
+
+        // The SCM removes the record only once the last handle closes; wait until a
+        // fresh open fails so the subsequent create_service does not hit
+        // ERROR_SERVICE_MARKED_FOR_DELETE.
+        for _ in 0..40 {
+            if service_manager
+                .open_service("sloth_clash_service", ServiceAccess::QUERY_STATUS)
+                .is_err()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
     }
 
     let service_binary_path = env::current_exe()
@@ -259,6 +335,30 @@ fn main() -> anyhow::Result<()> {
     let service = service_manager.create_service(&service_info, start_access)?;
 
     service.set_description("Sloth Clash Service — IPC helper for Sloth Clash / mihomo.")?;
+
+    // Persist the core content pin into the service's OWN environment so it is read
+    // at service start (Fix 1 / security.rs). The SCM applies the per-service
+    // `Environment` value — a REG_MULTI_SZ of "NAME=VALUE" entries under
+    // HKLM\SYSTEM\CurrentControlSet\Services\<name> — to the service process. Written
+    // before start so the immediate start below picks it up. Idempotent install
+    // (stop→delete→recreate) means each reinstall overwrites it with the fresh pin.
+    if let Some(pin) = parse_core_sha256() {
+        let data = format!("SLOTH_CLASH_CORE_SHA256={pin}");
+        let key = r"HKLM\SYSTEM\CurrentControlSet\Services\sloth_clash_service";
+        let status = std::process::Command::new("reg")
+            .args([
+                "add", key, "/v", "Environment", "/t", "REG_MULTI_SZ", "/d", &data, "/f",
+            ])
+            .status()
+            .map_err(|e| anyhow::anyhow!("failed to run reg.exe to persist core pin: {e}"))?;
+        if !status.success() {
+            return Err(anyhow::anyhow!(
+                "failed to persist SLOTH_CLASH_CORE_SHA256 to service environment (reg exit {:?})",
+                status.code()
+            ));
+        }
+    }
+
     service.start(&Vec::<&OsStr>::new())?;
 
     Ok(())

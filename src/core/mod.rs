@@ -11,6 +11,8 @@ mod logger;
 #[cfg(feature = "standalone")]
 mod manager;
 #[cfg(feature = "standalone")]
+mod security;
+#[cfg(feature = "standalone")]
 mod server;
 #[cfg(feature = "standalone")]
 mod state;

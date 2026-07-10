@@ -127,6 +127,19 @@ impl CoreManager {
 
         info!("Starting core with config: {:?}", config);
 
+        // Layer-1 LPE mitigation: never execute an attacker-writable path as
+        // SYSTEM/root, and don't let the config point at a protected location.
+        let core_path = crate::core::security::validate_core_path(&config.core_config.core_path)?;
+        crate::core::security::validate_config_location(
+            &config.core_config.config_dir,
+            "config directory",
+        )?;
+        crate::core::security::validate_config_location(
+            &config.core_config.config_path,
+            "config file",
+        )?;
+        let core_path = core_path.to_string_lossy().into_owned();
+
         let args = vec![
             "-d",
             config.core_config.config_dir.as_str(),
@@ -140,8 +153,7 @@ impl CoreManager {
             config.core_config.core_ipc_path.as_str(),
         ];
 
-        let child_guard =
-            run_with_logging(&config.core_config.core_path, &args, &config.log_config).await?;
+        let child_guard = run_with_logging(&core_path, &args, &config.log_config).await?;
 
         {
             let mut child_lock = self.running_child.lock().await;
@@ -263,6 +275,18 @@ impl CoreManager {
 
                                 let config_guard = config_arc.lock().await;
                                 if let Some(config) = config_guard.as_ref() {
+                                    // Re-validate on every respawn: the on-disk
+                                    // binary could have been swapped since start.
+                                    let core_path = match crate::core::security::validate_core_path(
+                                        &config.core_config.core_path,
+                                    ) {
+                                        Ok(p) => p.to_string_lossy().into_owned(),
+                                        Err(e) => {
+                                            error!("Refusing to restart core: {}", e);
+                                            break;
+                                        }
+                                    };
+
                                     let args = vec![
                                         "-d",
                                         config.core_config.config_dir.as_str(),
@@ -270,12 +294,8 @@ impl CoreManager {
                                         config.core_config.config_path.as_str(),
                                     ];
 
-                                    match run_with_logging(
-                                        &config.core_config.core_path,
-                                        &args,
-                                        &config.log_config,
-                                    )
-                                    .await
+                                    match run_with_logging(&core_path, &args, &config.log_config)
+                                        .await
                                     {
                                         Ok(new_guard) => {
                                             let mut lock = child_arc.lock().await;
@@ -337,8 +357,9 @@ impl CoreManager {
                     warn!("{:?} does not exist, skipping permission setting", target);
                     return;
                 }
-                match fs::set_permissions(target, Permissions::from_mode(0o777)).await {
-                    Ok(_) => info!("Permissions set to 777 for {:?}", target),
+                // Layer-2: group-accessible (via the setgid socket dir), not world.
+                match fs::set_permissions(target, Permissions::from_mode(0o660)).await {
+                    Ok(_) => info!("Permissions set to 660 for {:?}", target),
                     Err(e) => warn!("Failed to set permissions for {:?}: {}", target, e),
                 }
             });

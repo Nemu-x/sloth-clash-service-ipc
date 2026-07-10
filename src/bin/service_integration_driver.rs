@@ -29,6 +29,11 @@ async fn main() -> anyhow::Result<()> {
 
 async fn start_flow() -> anyhow::Result<()> {
     wait_ipc_ready().await?;
+    // NOTE: the Layer-1 allow-list is enforced in the *service* process, not here.
+    // In the integration workflow the mock core lives in the user-writable
+    // `target/release`, so the service must whitelist that directory via its own
+    // environment (`SLOTH_CLASH_CORE_ALLOWED_DIRS`) — see the CI workflow. In real
+    // deployments the core lives under an admin-only dir and needs no whitelist.
     let config = ClashConfig {
         core_config: CoreConfig {
             core_path: mock_binary_path()?,

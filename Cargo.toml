@@ -1,6 +1,6 @@
 [package]
 name = "sloth_clash_service_ipc"
-version = "2.2.0"
+version = "2.3.0"
 edition = "2024"
 authors = ["Tunglies"]
 license = "GPL-3.0"
@@ -51,6 +51,7 @@ standalone = [
     "dep:platform_lib",
     "dep:nix",
     "compact_str",
+    "sha2",
 ]
 client = [
     "kode-bridge/client",
@@ -96,6 +97,7 @@ flexi_logger = { version = "0.31", optional = true }
 log = { version = "0.4.28", optional = true }
 tracing-log = { version = "0.2", optional = true }
 compact_str = { version = "0.9", features = ["serde"], optional = true }
+sha2 = { version = "0.11", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 platform_lib = { package = "libc", version = "0.2", optional = true }
