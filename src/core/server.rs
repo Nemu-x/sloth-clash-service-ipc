@@ -53,9 +53,15 @@ pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
             use tokio::fs;
 
             tokio::time::sleep(Duration::from_millis(50)).await;
-            // Layer-2: root-owned socket, group-accessible (the setgid parent dir
-            // gives it the GUI user's group). 0o660 keeps the non-admin GUI working
-            // via group membership without exposing it world-wide (was 0o777).
+            // Layer-2 socket hardening. Linux: root-owned, group-accessible via the
+            // setgid parent dir (0o660) — the non-admin GUI works through group
+            // membership without world exposure. macOS: keep the original
+            // world-accessible mode; the GUI connects through /tmp and group-scoping
+            // there caused a reboot admin-prompt loop (base commit 6a63cda). The real
+            // macOS boundary is Layer-3 caller auth (SecCode), not socket perms.
+            #[cfg(target_os = "macos")]
+            fs::set_permissions(IPC_PATH, Permissions::from_mode(0o777)).await?;
+            #[cfg(not(target_os = "macos"))]
             fs::set_permissions(IPC_PATH, Permissions::from_mode(0o660)).await?;
 
             spawn_socket_dir_watchdog();
@@ -132,12 +138,14 @@ async fn make_ipc_dir() -> Result<()> {
             }
         }
 
-        // See issues in https://github.com/clash-verge-rev/clash-verge-rev/issues/6149
-        // Apply the SetGID bit (0o2000) to ensure the IPC socket inherits the directory's group ID.
-        // The mode is set to 0o2770 (rwxrws---) to permit the designated user group (e.g., staff
-        // on macOS or the primary group on Linux) to manage the socket's lifecycle. This prevents
-        // permission denied errors when the GUI process, running with non-root privileges,
-        // attempts to recreate the socket during service initialization or sidecar fallbacks.
+        // macOS app connects as an unprivileged GUI user through /tmp.
+        // Keep the socket directory world-traversable with sticky bit to avoid
+        // recurring "permission denied" after reboot (which forces osascript/admin prompt).
+        #[cfg(target_os = "macos")]
+        fs::set_permissions(dir_path, Permissions::from_mode(0o1777)).await?;
+
+        // Linux keeps group-managed semantics for the service/user group pair.
+        #[cfg(not(target_os = "macos"))]
         fs::set_permissions(dir_path, Permissions::from_mode(0o2770)).await?;
     }
     #[cfg(windows)]
@@ -224,7 +232,13 @@ pub fn spawn_socket_dir_watchdog() {
                 }
                 use std::fs::Permissions;
                 use std::os::unix::fs::PermissionsExt;
-                // Layer-2: group-scoped (setgid) instead of world-writable 0o777.
+                // Layer-2: Linux is group-scoped (setgid) instead of world-writable.
+                // macOS keeps 1777 (sticky world dir): the non-admin GUI connects
+                // through /tmp and group-scoping there caused a reboot admin-prompt
+                // loop (base commit 6a63cda). Real macOS boundary = Layer-3 SecCode.
+                #[cfg(target_os = "macos")]
+                let _ = tokio::fs::set_permissions(dir, Permissions::from_mode(0o1777)).await;
+                #[cfg(not(target_os = "macos"))]
                 let _ = tokio::fs::set_permissions(dir, Permissions::from_mode(0o2770)).await;
                 info!("IPC socket directory {:?} recreated", dir);
             }
