@@ -113,6 +113,15 @@ mod tests {
     }
 
     async fn step_start_mock_binary() {
+        // The Layer-1 core-path allow-list rejects execution from user-writable
+        // directories by default. `target/debug` is user-writable in dev, so
+        // register it the way an admin/installer would whitelist the real core's
+        // directory: via the SYSTEM service's own environment.
+        if let Some(core_dir) = bin_path().parent() {
+            unsafe {
+                env::set_var("SLOTH_CLASH_CORE_ALLOWED_DIRS", core_dir);
+            }
+        }
         let clash_config = ClashConfig {
             core_config: CoreConfig {
                 core_path: bin_path().to_string_lossy().to_string(),
