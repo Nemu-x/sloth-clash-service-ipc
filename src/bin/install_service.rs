@@ -55,11 +55,83 @@ fn parse_core_sha256() -> Option<String> {
 /// So we mirror what the macOS installer already does with
 /// `/Library/PrivilegedHelperTools`: copy into an admin-only directory and
 /// register THAT path. The staging dir then carries no trust at all.
+/// The Program Files roots — the only locations we accept, because their
+/// inherited ACL is admin-only.
+#[cfg(windows)]
+fn program_files_roots() -> Vec<std::path::PathBuf> {
+    ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .map(std::path::PathBuf::from)
+        .collect()
+}
+
+/// True when `path` sits inside a Program Files root (case-insensitive, both
+/// sides canonicalized so `..`/short-names/symlinks cannot smuggle a path out).
+#[cfg(windows)]
+fn is_under_program_files(path: &std::path::Path) -> bool {
+    let Ok(canonical) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let needle = canonical.to_string_lossy().to_lowercase();
+    program_files_roots().iter().any(|root| {
+        std::fs::canonicalize(root)
+            .map(|r| {
+                let prefix = r.to_string_lossy().to_lowercase();
+                needle == prefix || needle.starts_with(&format!("{prefix}\\"))
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// `--install-dir <path>`: where the desktop app is installed, so the service
+/// can live alongside it instead of in a second Program Files tree.
+///
+/// SECURITY: this value comes from the (possibly non-admin) app, so it is
+/// treated as untrusted input. It is honoured **only** if it resolves inside
+/// Program Files; otherwise we ignore it and fall back to our own admin-only
+/// directory. Without that check a caller could point the elevated installer at
+/// a user-writable directory and reintroduce the very swap this fix prevents.
+#[cfg(windows)]
+fn parse_install_dir() -> Option<std::path::PathBuf> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut raw: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if let Some(v) = a.strip_prefix("--install-dir=") {
+            raw = Some(v.to_string());
+        } else if a == "--install-dir" {
+            if let Some(v) = args.get(i + 1) {
+                raw = Some(v.clone());
+            }
+            i += 1;
+        }
+        i += 1;
+    }
+
+    let candidate = std::path::PathBuf::from(raw?.trim());
+    if !candidate.is_absolute() || !is_under_program_files(&candidate) {
+        eprintln!(
+            "ignoring --install-dir {}: not inside Program Files",
+            candidate.display()
+        );
+        return None;
+    }
+    Some(candidate)
+}
+
 #[cfg(windows)]
 fn privileged_install_dir() -> anyhow::Result<std::path::PathBuf> {
-    // ProgramW6432 resolves to the real (64-bit) Program Files even from a
-    // 32-bit installer process; ProgramFiles is the normal fallback. Both are
-    // admin-only by inherited ACL, which is exactly the property we need.
+    // Preferred: a `service` subfolder of the app's own install directory, so
+    // everything lives under one tree (…\Nemu-x\Sloth Clash\service).
+    if let Some(app_dir) = parse_install_dir() {
+        return Ok(app_dir.join("service"));
+    }
+
+    // Fallback (dev/portable builds, or a rejected --install-dir): our own
+    // admin-only directory. ProgramW6432 resolves to the real (64-bit) Program
+    // Files even from a 32-bit installer process.
     let base = std::env::var("ProgramW6432")
         .or_else(|_| std::env::var("ProgramFiles"))
         .map_err(|_| anyhow::anyhow!("neither ProgramW6432 nor ProgramFiles is set"))?;
@@ -503,6 +575,37 @@ mod tests {
         assert!(
             path.ends_with("slothclash\\service"),
             "unexpected service dir layout: {path}"
+        );
+    }
+
+    /// `--install-dir` is attacker-influenceable input: only Program Files
+    /// paths may be honoured, everything else must be rejected so the elevated
+    /// installer can never be pointed at a user-writable directory.
+    #[test]
+    fn install_dir_accepts_only_program_files() {
+        let program_files =
+            std::env::var("ProgramFiles").expect("ProgramFiles should be set on Windows");
+        assert!(
+            is_under_program_files(std::path::Path::new(&program_files)),
+            "the Program Files root itself must validate"
+        );
+
+        for bad in [
+            std::env::var("TEMP").unwrap_or_else(|_| r"C:\Windows\Temp".into()),
+            std::env::var("LOCALAPPDATA").unwrap_or_else(|_| r"C:\Users\x\AppData\Local".into()),
+            r"C:\Windows".into(),
+        ] {
+            assert!(
+                !is_under_program_files(std::path::Path::new(&bad)),
+                "user-writable / non-Program-Files path must be rejected: {bad}"
+            );
+        }
+
+        // A traversal that escapes Program Files must not sneak through.
+        let escape = std::path::PathBuf::from(&program_files).join("..");
+        assert!(
+            !is_under_program_files(&escape),
+            "`..` traversal out of Program Files must be rejected"
         );
     }
 }

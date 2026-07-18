@@ -95,8 +95,15 @@ fn main() -> anyhow::Result<()> {
     let manager_access = ServiceManagerAccess::CONNECT;
     let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
 
-    let service_access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
+    let service_access =
+        ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG | ServiceAccess::STOP | ServiceAccess::DELETE;
     let service = service_manager.open_service("sloth_clash_service", service_access)?;
+
+    // Read where the binary actually lives BEFORE deleting the registration —
+    // install_service.rs may have placed it next to the app (--install-dir) or
+    // in our own fallback directory, so the ImagePath is the only reliable
+    // source for cleanup.
+    let installed_binary = service.query_config().ok().map(|cfg| cfg.executable_path);
 
     let service_status = service.query_status()?;
     if service_status.current_state != ServiceState::Stopped {
@@ -110,20 +117,23 @@ fn main() -> anyhow::Result<()> {
     service.delete()?;
 
     // Remove the privileged copy of the binary (install_service.rs lands it
-    // there); mirrors the macOS bundle cleanup. Best-effort: the image may stay
+    // there); mirrors the macOS bundle cleanup. Best-effort: the image can stay
     // locked briefly after delete, and installs predating the privileged-dir
-    // change have nothing here.
-    if let Ok(base) =
-        std::env::var("ProgramW6432").or_else(|_| std::env::var("ProgramFiles"))
-    {
-        let install_dir = std::path::PathBuf::from(base).join("SlothClash").join("service");
-        if install_dir.exists() {
-            for _ in 0..12 {
-                if std::fs::remove_dir_all(&install_dir).is_ok() {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(250));
+    // change point at a temp path that may already be gone.
+    //
+    // Only the `service` directory we created is removed — never the app's own
+    // install directory, which may be the ImagePath's grandparent.
+    if let Some(binary) = installed_binary {
+        for _ in 0..12 {
+            if !binary.exists() || std::fs::remove_file(&binary).is_ok() {
+                break;
             }
+            thread::sleep(Duration::from_millis(250));
+        }
+        if let Some(dir) = binary.parent()
+            && dir.file_name().and_then(|n| n.to_str()) == Some("service")
+        {
+            let _ = std::fs::remove_dir(dir); // only succeeds when empty
         }
     }
 
