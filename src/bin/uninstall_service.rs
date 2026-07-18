@@ -69,6 +69,14 @@ fn main() -> Result<(), Error> {
             .map_err(|e| anyhow::anyhow!("Failed to remove service file: {}", e))?;
     }
 
+    // Remove the privileged copy of the binary (install_service.rs lands it
+    // here); mirrors the macOS bundle cleanup. Best-effort: an install that
+    // predates the privileged-dir change has nothing here.
+    let install_dir = std::path::Path::new("/usr/local/lib/sloth-clash");
+    if install_dir.exists() {
+        let _ = std::fs::remove_dir_all(install_dir);
+    }
+
     // Reload systemd
     let _ = run_command("systemctl", &["daemon-reload"], debug);
 
@@ -100,6 +108,25 @@ fn main() -> anyhow::Result<()> {
     }
 
     service.delete()?;
+
+    // Remove the privileged copy of the binary (install_service.rs lands it
+    // there); mirrors the macOS bundle cleanup. Best-effort: the image may stay
+    // locked briefly after delete, and installs predating the privileged-dir
+    // change have nothing here.
+    if let Ok(base) =
+        std::env::var("ProgramW6432").or_else(|_| std::env::var("ProgramFiles"))
+    {
+        let install_dir = std::path::PathBuf::from(base).join("SlothClash").join("service");
+        if install_dir.exists() {
+            for _ in 0..12 {
+                if std::fs::remove_dir_all(&install_dir).is_ok() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+
     println!("Service uninstalled successfully. Resource cleanup warnings can be ignored.");
     Ok(())
 }

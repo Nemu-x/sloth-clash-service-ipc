@@ -42,6 +42,56 @@ fn parse_core_sha256() -> Option<String> {
     }
 }
 
+/// Directory the service binary is copied into before it is registered.
+///
+/// The installer is executed from wherever the caller staged it — the desktop
+/// app extracts it into a *per-user temp dir* and only then elevates — so
+/// registering the service against `current_exe()`'s sibling would point the
+/// SYSTEM/root service at a **user-writable** path. A non-admin could then swap
+/// that binary while the service is stopped and get code execution as
+/// SYSTEM/root: precisely the Layer-1 boundary `security.rs` exists to hold
+/// ("never let the service execute a binary a non-admin could have swapped").
+///
+/// So we mirror what the macOS installer already does with
+/// `/Library/PrivilegedHelperTools`: copy into an admin-only directory and
+/// register THAT path. The staging dir then carries no trust at all.
+#[cfg(windows)]
+fn privileged_install_dir() -> anyhow::Result<std::path::PathBuf> {
+    // ProgramW6432 resolves to the real (64-bit) Program Files even from a
+    // 32-bit installer process; ProgramFiles is the normal fallback. Both are
+    // admin-only by inherited ACL, which is exactly the property we need.
+    let base = std::env::var("ProgramW6432")
+        .or_else(|_| std::env::var("ProgramFiles"))
+        .map_err(|_| anyhow::anyhow!("neither ProgramW6432 nor ProgramFiles is set"))?;
+    Ok(std::path::PathBuf::from(base)
+        .join("SlothClash")
+        .join("service"))
+}
+
+/// Copy the staged binary over the privileged one, retrying briefly: right
+/// after the old service is stopped/deleted Windows can still hold the image
+/// open for a moment, which would fail the copy.
+#[cfg(windows)]
+fn copy_binary_with_retry(from: &std::path::Path, to: &std::path::Path) -> anyhow::Result<()> {
+    let mut last_err = None;
+    for _ in 0..40 {
+        match std::fs::copy(from, to) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "failed to copy service binary to {}: {}",
+        to.display(),
+        last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown error".into())
+    ))
+}
+
 #[cfg(unix)]
 fn env_u32(key: &str) -> Option<u32> {
     std::env::var(key).ok()?.parse().ok()
@@ -199,33 +249,52 @@ fn main() -> Result<(), Error> {
 
     let debug = env::args().any(|arg| arg == "--debug");
 
-    let service_binary_path = env::current_exe()
+    // The binary as staged next to this installer (typically a per-user temp
+    // dir) — untrusted location, used only as the copy source.
+    let staged_binary = env::current_exe()
         .unwrap()
         .with_file_name("sloth-clash-service");
 
-    if !service_binary_path.exists() {
+    if !staged_binary.exists() {
         return Err(anyhow::anyhow!("sloth-clash-service binary not found"));
     }
 
-    // Check service status
-    let status_output = std::process::Command::new("systemctl")
-        .args(["status", &format!("{}.service", SERVICE_NAME), "--no-pager"])
-        .output()
-        .map_err(|e| anyhow::anyhow!("Failed to check service status: {}", e))?;
+    // Idempotent, self-healing install (mirrors the Windows path): always stop,
+    // re-lay the binary and rewrite the unit, so an upgrade actually replaces a
+    // previously shipped-vulnerable install instead of returning early. The old
+    // behaviour ("running -> return Ok") meant an existing install could never
+    // be migrated or repaired.
+    let _ = run_command(
+        "systemctl",
+        &["stop", &format!("{}.service", SERVICE_NAME)],
+        debug,
+    );
 
-    match status_output.status.code() {
-        Some(0) => return Ok(()), // Service is running
-        Some(1) | Some(2) | Some(3) => {
-            run_command(
-                "systemctl",
-                &["start", &format!("{}.service", SERVICE_NAME)],
-                debug,
-            )?;
-            return Ok(());
-        }
-        Some(4) => {} // Service not found, continue with installation
-        _ => return Err(anyhow::anyhow!("Unexpected systemctl status code")),
+    // Land the binary in a root-only directory and point the unit at THAT path,
+    // so a non-admin can never swap what the root service executes.
+    let install_dir = Path::new("/usr/local/lib/sloth-clash");
+    std::fs::create_dir_all(install_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to create service directory {}: {}",
+            install_dir.display(),
+            e
+        )
+    })?;
+    let service_binary_path = install_dir.join(SERVICE_NAME);
+    if staged_binary != service_binary_path {
+        std::fs::copy(&staged_binary, &service_binary_path)
+            .map_err(|e| anyhow::anyhow!("Failed to copy service binary: {}", e))?;
     }
+    let service_binary_str = service_binary_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("service binary path is not valid UTF-8"))?;
+    let _ = run_command("chown", &["root:root", service_binary_str], debug);
+    let _ = run_command("chmod", &["755", service_binary_str], debug);
+    let install_dir_str = install_dir
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("service directory path is not valid UTF-8"))?;
+    let _ = run_command("chown", &["root:root", install_dir_str], debug);
+    let _ = run_command("chmod", &["755", install_dir_str], debug);
 
     // Create and write unit file
     let unit_file = format!("/etc/systemd/system/{}.service", SERVICE_NAME);
@@ -240,7 +309,7 @@ fn main() -> Result<(), Error> {
 
     let unit_file_content = format!(
         include_str!("../../resources/systemd_service_unit.tmpl"),
-        exec_start = service_binary_path.to_str().unwrap(),
+        exec_start = service_binary_str,
         group = resolve_service_group_name(),
         env_line = env_line,
     );
@@ -309,13 +378,30 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let service_binary_path = env::current_exe()
+    // The binary as staged next to this installer (typically a per-user temp
+    // dir) — untrusted location, used only as the copy source.
+    let staged_binary = env::current_exe()
         .unwrap()
         .with_file_name("sloth-clash-service.exe");
 
-    if !service_binary_path.exists() {
+    if !staged_binary.exists() {
         eprintln!("sloth-clash-service.exe not found");
         std::process::exit(2);
+    }
+
+    // Land the binary in an admin-only directory and register THAT path, so a
+    // non-admin can never swap what the SYSTEM service executes. The old
+    // service (if any) was stopped and deleted above, releasing the image.
+    let install_dir = privileged_install_dir()?;
+    std::fs::create_dir_all(&install_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to create service directory {}: {e}",
+            install_dir.display()
+        )
+    })?;
+    let service_binary_path = install_dir.join("sloth-clash-service.exe");
+    if staged_binary != service_binary_path {
+        copy_binary_with_retry(&staged_binary, &service_binary_path)?;
     }
 
     let service_info = ServiceInfo {
@@ -392,6 +478,33 @@ pub fn uninstall_old_service() -> Result<(), Error> {
     }
 
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    /// Locks in the Layer-1 intent: the registered service binary must live in
+    /// an admin-only directory, never in a user-writable one (a temp dir being
+    /// the regression this guards against).
+    #[test]
+    fn privileged_install_dir_is_admin_only_not_temp() {
+        let dir = privileged_install_dir().expect("ProgramFiles should resolve on Windows");
+        let path = dir.to_string_lossy().to_lowercase();
+
+        assert!(
+            path.contains("program files"),
+            "service dir must be under Program Files (admin-only ACL), got: {path}"
+        );
+        assert!(
+            !path.contains("\\temp\\") && !path.contains("\\appdata\\"),
+            "service dir must never be user-writable (temp/appdata), got: {path}"
+        );
+        assert!(
+            path.ends_with("slothclash\\service"),
+            "unexpected service dir layout: {path}"
+        );
+    }
 }
 
 pub fn run_command(cmd: &str, args: &[&str], debug: bool) -> Result<(), Error> {
