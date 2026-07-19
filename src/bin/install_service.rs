@@ -169,9 +169,40 @@ fn env_u32(key: &str) -> Option<u32> {
     std::env::var(key).ok()?.parse().ok()
 }
 
+/// The macOS console owner — the human actually logged into the GUI. Used only
+/// as a late fallback, when sudo/pkexec left us no environment to work with.
+#[cfg(target_os = "macos")]
+fn console_user_name() -> Option<String> {
+    let out = std::process::Command::new("/usr/bin/stat")
+        .args(["-f", "%Su", "/dev/console"])
+        .output()
+        .ok()?;
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if name.is_empty() || name == "root" {
+        return None;
+    }
+    Some(name)
+}
+
+/// Group that owns the IPC socket, i.e. the group the **non-admin GUI user**
+/// belongs to — the installer runs as root, so the invoking user has to be
+/// recovered from the environment.
+///
+/// Getting this wrong is worse than failing: a socket owned by root's group
+/// installs "successfully" but the app can never talk to the service. So each
+/// step below identifies the real invoking user; we only give up when nothing
+/// at all points at one, which is genuinely the "you ran me as bare root"
+/// case the message describes.
 #[cfg(unix)]
 fn resolve_service_group_name() -> String {
     use nix::unistd::{Gid, Group, Uid, User};
+
+    let group_of_user = |user: User| -> Option<String> {
+        match Group::from_gid(user.gid) {
+            Ok(Some(group)) => Some(group.name),
+            _ => None,
+        }
+    };
 
     if let Some(gid) = env_u32("SLOTH_CLASH_SERVICE_GID")
         && let Ok(Some(group)) = Group::from_gid(Gid::from_raw(gid))
@@ -181,15 +212,42 @@ fn resolve_service_group_name() -> String {
 
     if let Some(uid) = env_u32("SUDO_UID").or_else(|| env_u32("PKEXEC_UID"))
         && let Ok(Some(user)) = User::from_uid(Uid::from_raw(uid))
-        && let Ok(Some(group)) = Group::from_gid(user.gid)
+        && let Some(name) = group_of_user(user)
     {
-        return group.name;
+        return name;
+    }
+
+    // Name-based counterpart of the uid lookup: some launchers export the user
+    // name but not the numeric id.
+    if let Some(login) = std::env::var("SUDO_USER")
+        .ok()
+        .or_else(|| std::env::var("PKEXEC_USER").ok())
+        && let Ok(Some(user)) = User::from_name(login.trim())
+        && let Some(name) = group_of_user(user)
+    {
+        return name;
     }
 
     if let Some(gid) = env_u32("SUDO_GID")
         && let Ok(Some(group)) = Group::from_gid(Gid::from_raw(gid))
     {
         return group.name;
+    }
+
+    // macOS keeps a reliable notion of "who is at the keyboard", and every
+    // regular account is in `staff` — enough to keep the socket reachable when
+    // the elevation helper stripped the environment.
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(login) = console_user_name()
+            && let Ok(Some(user)) = User::from_name(&login)
+            && let Some(name) = group_of_user(user)
+        {
+            return name;
+        }
+        if let Ok(Some(group)) = Group::from_name("staff") {
+            return group.name;
+        }
     }
 
     panic!("Please use sudo or pkexec to install service.");
