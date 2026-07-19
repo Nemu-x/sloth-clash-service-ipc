@@ -79,7 +79,7 @@ jobs:
           features: standalone
 
       - name: Update Tag
-        uses: richardsimko/update-tag@v1
+        uses: richardsimko/update-tag@v2
         with:
           tag_name: ${{ matrix.target }}
         env:
@@ -129,7 +129,7 @@ jobs:
 
       - name: Release
         if: matrix.os == 'windows-latest'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: ${{ matrix.target }}
           tag_name: ${{ matrix.target }}
@@ -141,7 +141,7 @@ jobs:
 
       - name: Release
         if: matrix.os != 'windows-latest'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: ${{ matrix.target }}
           tag_name: ${{ matrix.target }}

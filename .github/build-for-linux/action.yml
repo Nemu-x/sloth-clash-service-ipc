@@ -6,6 +6,16 @@ inputs:
   target:
     required: true
     description: "Rust Target"
+  # build.sh runs `cargo build --features $INPUT_FEATURES`. The caller has always
+  # passed `features`, but it was never declared here — it only reached the
+  # container because GitHub still exports undeclared inputs as INPUT_* for
+  # docker actions (while warning "Unexpected input(s) 'features'"). Should that
+  # ever stop, the bins (required-features = ["standalone"]) would silently not
+  # be built at all. Declare it, and default it so a caller that omits it works.
+  features:
+    required: false
+    default: "standalone"
+    description: "Cargo features to build with"
 
 runs:
   using: "docker"
