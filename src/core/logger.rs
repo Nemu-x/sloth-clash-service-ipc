@@ -26,7 +26,7 @@ pub fn service_writer(config: &WriterConfig) -> Result<FileLogWriter> {
     let _ = std::fs::create_dir_all(&directory);
 
     // Clamp caller-controlled sizing to bound disk-fill DoS.
-    let max_log_size = config.max_log_size.clamp(1 * 1024 * 1024, 100 * 1024 * 1024);
+    let max_log_size = config.max_log_size.clamp(1024 * 1024, 100 * 1024 * 1024);
     let max_log_files = config.max_log_files.clamp(1, 32);
 
     Ok(FileLogWriter::builder(

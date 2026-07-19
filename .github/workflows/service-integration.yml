@@ -27,9 +27,16 @@ jobs:
       - name: Build binaries
         run: cargo build --release --features "standalone client test"
 
+      # The hardened service (>= 2.3.0) only spawns a core that either matches a
+      # pinned SHA-256 or lives in an admin-only directory. The mock binary sits
+      # in target/release (user-writable), so the test must pin it — exactly what
+      # the desktop app does at install time. Without this the service correctly
+      # refuses to start the mock and the run fails.
       - name: Install service (Linux)
         if: runner.os == 'Linux'
-        run: sudo target/release/sloth-clash-service-install --debug
+        run: |
+          CORE_SHA=$(sha256sum target/release/mock_binary | cut -d' ' -f1)
+          sudo target/release/sloth-clash-service-install --debug --core-sha256 "$CORE_SHA"
 
       - name: Verify service (Linux)
         if: runner.os == 'Linux'
@@ -52,7 +59,9 @@ jobs:
 
       - name: Install service (macOS)
         if: runner.os == 'macOS'
-        run: sudo target/release/sloth-clash-service-install --debug
+        run: |
+          CORE_SHA=$(shasum -a 256 target/release/mock_binary | cut -d' ' -f1)
+          sudo target/release/sloth-clash-service-install --debug --core-sha256 "$CORE_SHA"
 
       - name: Verify service (macOS)
         if: runner.os == 'macOS'
@@ -77,7 +86,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          & "$env:GITHUB_WORKSPACE\\target\\release\\sloth-clash-service-install.exe"
+          $sha = (Get-FileHash "$env:GITHUB_WORKSPACE\\target\\release\\mock_binary.exe" -Algorithm SHA256).Hash.ToLower()
+          & "$env:GITHUB_WORKSPACE\\target\\release\\sloth-clash-service-install.exe" --core-sha256 $sha
           Start-Sleep -Seconds 2
 
       - name: Verify service (Windows)
