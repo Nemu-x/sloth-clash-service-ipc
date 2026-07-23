@@ -410,6 +410,29 @@ fn create_ipc_router() -> Result<Router> {
                     .text(format!("Invalid JSON: {}", e))
                     .build()),
             }
+        })
+        .delete(IpcCommand::RemoveTun.as_ref(), |ctx| async move {
+            trace!("Received RemoveTun command");
+            ipc_request_context_to_auth_context(&ctx)?;
+            // Best-effort: a failed sweep is not a server error. The app only
+            // calls this to recover a stuck adapter and will surface its own
+            // guidance if the create still fails, so we always answer 200 and
+            // report how many adapters were removed in `data`.
+            let removed = super::tun_cleanup::remove_tun_adapters()
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("RemoveTun sweep failed: {e}");
+                    0
+                });
+            let json_value = Response {
+                code: 0,
+                message: "Success".to_string(),
+                data: Some(removed),
+            };
+            Ok(HttpResponse::builder()
+                .status(StatusCode::OK)
+                .json(&json_value)?
+                .build())
         });
     Ok(router)
 }

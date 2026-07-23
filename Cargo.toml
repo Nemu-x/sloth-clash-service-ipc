@@ -1,6 +1,6 @@
 [package]
 name = "sloth_clash_service_ipc"
-version = "2.4.1"
+version = "2.4.2"
 edition = "2024"
 authors = ["Tunglies"]
 license = "GPL-3.0"

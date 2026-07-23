@@ -142,6 +142,32 @@ pub async fn stop_clash() -> Result<Response<()>> {
     Ok(response)
 }
 
+/// Force-remove any stale wintun TUN adapter (Windows). Returns the number
+/// removed in `data`; a no-op on other platforms answers `0`.
+///
+/// Unlike the other calls this drives a PowerShell PnP sweep on the service
+/// side, which routinely takes several seconds, so it uses its own client with a
+/// generous timeout instead of the shared 50 ms one that fits the fast commands.
+pub async fn remove_tun() -> Result<Response<u32>> {
+    let client = kode_bridge::IpcHttpClient::with_config(
+        IPC_PATH,
+        ClientConfig {
+            default_timeout: Duration::from_secs(30),
+            max_retries: 1,
+            retry_delay: Duration::from_millis(150),
+            enable_pooling: true,
+            ..Default::default()
+        },
+    )?;
+    let response = client
+        .delete(IpcCommand::RemoveTun.as_ref())
+        .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
+        .send()
+        .await?
+        .json::<Response<u32>>()?;
+    Ok(response)
+}
+
 pub async fn update_writer(body: &WriterConfig) -> Result<Response<()>> {
     let client = connect().await?;
     let payload = body.to_json_value()?;

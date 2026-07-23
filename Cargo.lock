@@ -1068,7 +1068,7 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 
 [[package]]
 name = "sloth_clash_service_ipc"
-version = "2.4.1"
+version = "2.4.2"
 dependencies = [
  "anyhow",
  "clash_verge_logger",
