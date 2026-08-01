@@ -55,7 +55,9 @@ pub fn parse_vpnc_env(dump: &str) -> CorpSplit {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     for i in 0..n {
-        let addr = map.get(format!("CISCO_SPLIT_INC_{i}_ADDR").as_str()).copied();
+        let addr = map
+            .get(format!("CISCO_SPLIT_INC_{i}_ADDR").as_str())
+            .copied();
         let masklen = map
             .get(format!("CISCO_SPLIT_INC_{i}_MASKLEN").as_str())
             .copied();
@@ -102,10 +104,7 @@ pub fn extract_servercert_pin(stderr: &str) -> Option<String> {
         // `SHA256:ABCD...` in the fingerprint block.
         if let Some(idx) = line.to_ascii_lowercase().find("sha256:") {
             let rest = &line[idx + "sha256:".len()..];
-            let hex: String = rest
-                .chars()
-                .take_while(|c| c.is_ascii_hexdigit())
-                .collect();
+            let hex: String = rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
             if hex.len() >= 32 {
                 return Some(format!("sha256:{hex}"));
             }
@@ -189,7 +188,9 @@ mod imp {
 
         let mut child = cmd.spawn()?;
         if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(format!("{}\n", req.password).as_bytes()).await;
+            let _ = stdin
+                .write_all(format!("{}\n", req.password).as_bytes())
+                .await;
             let _ = stdin.shutdown().await;
         }
 
@@ -220,17 +221,20 @@ mod imp {
             if let Ok(Some(exit)) = child.try_wait() {
                 let stderr = drain_stderr(&mut child).await;
                 let _ = exit;
-                if req.servercert.trim().is_empty() {
-                    if let Some(pin) = extract_servercert_pin(&stderr) {
-                        return Ok(CorpVpnStatusData {
-                            connected: false,
-                            needs_cert_trust: true,
-                            servercert_sha256: pin,
-                            ..Default::default()
-                        });
-                    }
+                if req.servercert.trim().is_empty()
+                    && let Some(pin) = extract_servercert_pin(&stderr)
+                {
+                    return Ok(CorpVpnStatusData {
+                        connected: false,
+                        needs_cert_trust: true,
+                        servercert_sha256: pin,
+                        ..Default::default()
+                    });
                 }
-                anyhow::bail!("openconnect exited before the tunnel came up: {}", tail(&stderr));
+                anyhow::bail!(
+                    "openconnect exited before the tunnel came up: {}",
+                    tail(&stderr)
+                );
             }
             if tokio::time::Instant::now() > deadline {
                 let _ = child.start_kill();
@@ -256,11 +260,11 @@ mod imp {
     pub async fn status() -> CorpVpnStatusData {
         let mut st = STATE.lock().await;
         // If the child died, reflect disconnected.
-        if let Some(child) = st.child.as_mut() {
-            if let Ok(Some(_)) = child.try_wait() {
-                st.child = None;
-                st.status = CorpVpnStatusData::default();
-            }
+        if let Some(child) = st.child.as_mut()
+            && let Ok(Some(_)) = child.try_wait()
+        {
+            st.child = None;
+            st.status = CorpVpnStatusData::default();
         }
         st.status.clone()
     }
