@@ -23,6 +23,37 @@ pub struct WriterConfig {
     pub max_log_files: usize,
 }
 
+/// Request to bring up the corporate VPN. `bin_path` points at the OpenConnect
+/// executable the app downloaded on-demand (its bundle also contains the
+/// `vpnc-script` alongside it). `servercert` is empty on the first connect; the
+/// service returns the fingerprint to trust, and the app retries with it pinned.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct CorpVpnStartRequest {
+    pub bin_path: String,
+    pub gateway: String,
+    pub username: String,
+    pub password: String,
+    #[serde(default)]
+    pub servercert: String,
+}
+
+/// Corporate-VPN state reported back to the app. On a first connect against an
+/// untrusted certificate, `needs_cert_trust` is true and `servercert_sha256`
+/// carries the fingerprint to show the user. On success, `routes`/`dns_*` are
+/// what the gateway pushed — the app excludes `routes` from mihomo and splits
+/// DNS for `dns_domains`. `full_tunnel` means the gateway took the default route
+/// (no split is possible).
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct CorpVpnStatusData {
+    pub connected: bool,
+    pub needs_cert_trust: bool,
+    pub servercert_sha256: String,
+    pub routes: Vec<String>,
+    pub dns_servers: Vec<String>,
+    pub dns_domains: Vec<String>,
+    pub full_tunnel: bool,
+}
+
 #[cfg(feature = "response")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response<T> {

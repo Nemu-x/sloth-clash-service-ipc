@@ -2,7 +2,7 @@ use super::state::IpcState;
 use crate::core::auth::ipc_request_context_to_auth_context;
 use crate::core::logger::set_or_update_writer;
 use crate::core::manager::{CORE_MANAGER, LOGGER_MANAGER};
-use crate::core::structure::Response;
+use crate::core::structure::{CorpVpnStartRequest, Response};
 use crate::{ClashConfig, IpcCommand, VERSION, WriterConfig};
 use http::StatusCode;
 use kode_bridge::{IpcHttpServer, Result, Router, ipc_http_server::HttpResponse};
@@ -432,6 +432,59 @@ fn create_ipc_router() -> Result<Router> {
             Ok(HttpResponse::builder()
                 .status(StatusCode::OK)
                 .json(&json_value)?
+                .build())
+        })
+        .post(IpcCommand::StartCorpVpn.as_ref(), |ctx| async move {
+            trace!("Received StartCorpVpn command");
+            ipc_request_context_to_auth_context(&ctx)?;
+            match ctx.json::<CorpVpnStartRequest>() {
+                Ok(req) => match super::corp_vpn::start(req).await {
+                    Ok(data) => Ok(HttpResponse::builder()
+                        .status(StatusCode::OK)
+                        .json(&Response {
+                            code: 0,
+                            message: "Success".to_string(),
+                            data: Some(data),
+                        })?
+                        .build()),
+                    Err(e) => Ok(HttpResponse::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .json(&Response::<()> {
+                            code: 1,
+                            message: format!("start corp vpn: {e}"),
+                            data: None,
+                        })?
+                        .build()),
+                },
+                Err(e) => Ok(HttpResponse::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .text(format!("Invalid JSON: {e}"))
+                    .build()),
+            }
+        })
+        .delete(IpcCommand::StopCorpVpn.as_ref(), |ctx| async move {
+            trace!("Received StopCorpVpn command");
+            ipc_request_context_to_auth_context(&ctx)?;
+            let _ = super::corp_vpn::stop().await;
+            Ok(HttpResponse::builder()
+                .status(StatusCode::OK)
+                .json(&Response::<()> {
+                    code: 0,
+                    message: "Success".to_string(),
+                    data: None,
+                })?
+                .build())
+        })
+        .get(IpcCommand::CorpVpnStatus.as_ref(), |ctx| async move {
+            ipc_request_context_to_auth_context(&ctx)?;
+            let data = super::corp_vpn::status().await;
+            Ok(HttpResponse::builder()
+                .status(StatusCode::OK)
+                .json(&Response {
+                    code: 0,
+                    message: "Success".to_string(),
+                    data: Some(data),
+                })?
                 .build())
         });
     Ok(router)

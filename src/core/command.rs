@@ -24,6 +24,17 @@ pub enum IpcCommand {
     // service can. No-op on non-Windows and when no wintun adapter exists.
     #[strum(serialize = "/tun/remove")]
     RemoveTun,
+    // Corporate-VPN coexistence (corp-vpn-coexistence): spawn/supervise a bundled
+    // OpenConnect (Cisco AnyConnect protocol) as the privileged service, capturing
+    // the routes/DNS the gateway pushes so the app can split traffic (corp subnets
+    // via OpenConnect, everything else via mihomo). macOS-first. Only the SYSTEM
+    // service can bring up the corp tun / set its routes.
+    #[strum(serialize = "/corp/start")]
+    StartCorpVpn,
+    #[strum(serialize = "/corp/stop")]
+    StopCorpVpn,
+    #[strum(serialize = "/corp/status")]
+    CorpVpnStatus,
     #[strum(serialize = "/writer")]
     UpdateWriter,
     #[strum(serialize = "/magic")]

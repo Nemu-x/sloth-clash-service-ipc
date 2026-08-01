@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 
 use crate::{
     ClashConfig, IPC_AUTH_EXPECT, IPC_PATH, IpcCommand, WriterConfig,
-    core::structure::{JsonConvert, Response},
+    core::structure::{CorpVpnStartRequest, CorpVpnStatusData, JsonConvert, Response},
 };
 
 static CLIENT_CONFIG: Lazy<Arc<RwLock<Option<IpcConfig>>>> =
@@ -165,6 +165,54 @@ pub async fn remove_tun() -> Result<Response<u32>> {
         .send()
         .await?
         .json::<Response<u32>>()?;
+    Ok(response)
+}
+
+/// Bring up the corporate VPN sidecar. The OpenConnect handshake (TLS + auth +
+/// route push) routinely takes several seconds, so — like `remove_tun` — this
+/// uses a dedicated client with a generous timeout rather than the 50 ms one the
+/// fast commands share.
+pub async fn start_corp_vpn(body: &CorpVpnStartRequest) -> Result<Response<CorpVpnStatusData>> {
+    let client = kode_bridge::IpcHttpClient::with_config(
+        IPC_PATH,
+        ClientConfig {
+            default_timeout: Duration::from_secs(45),
+            max_retries: 1,
+            retry_delay: Duration::from_millis(150),
+            enable_pooling: true,
+            ..Default::default()
+        },
+    )?;
+    let payload = body.to_json_value()?;
+    let response = client
+        .post(IpcCommand::StartCorpVpn.as_ref())
+        .json_body(&payload)
+        .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
+        .send()
+        .await?
+        .json::<Response<CorpVpnStatusData>>()?;
+    Ok(response)
+}
+
+pub async fn stop_corp_vpn() -> Result<Response<()>> {
+    let client = connect().await?;
+    let response = client
+        .delete(IpcCommand::StopCorpVpn.as_ref())
+        .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
+        .send()
+        .await?
+        .json::<Response<()>>()?;
+    Ok(response)
+}
+
+pub async fn corp_vpn_status() -> Result<Response<CorpVpnStatusData>> {
+    let client = connect().await?;
+    let response = client
+        .get(IpcCommand::CorpVpnStatus.as_ref())
+        .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
+        .send()
+        .await?
+        .json::<Response<CorpVpnStatusData>>()?;
     Ok(response)
 }
 
