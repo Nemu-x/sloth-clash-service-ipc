@@ -52,6 +52,9 @@ pub struct CorpVpnStatusData {
     pub dns_servers: Vec<String>,
     pub dns_domains: Vec<String>,
     pub full_tunnel: bool,
+    /// Recent OpenConnect stderr lines (most recent last), for the UI log view.
+    #[serde(default)]
+    pub log_tail: Vec<String>,
 }
 
 #[cfg(feature = "response")]

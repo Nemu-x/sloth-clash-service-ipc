@@ -121,17 +121,25 @@ pub fn extract_servercert_pin(stderr: &str) -> Option<String> {
 #[cfg(all(feature = "standalone", target_os = "macos"))]
 mod imp {
     use super::*;
+    use std::collections::VecDeque;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use once_cell::sync::Lazy;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     use tokio::sync::Mutex;
+
+    /// Cap on retained OpenConnect log lines (ring buffer).
+    const LOG_CAP: usize = 200;
+
+    type LogBuffer = Arc<Mutex<VecDeque<String>>>;
 
     struct State {
         child: Option<tokio::process::Child>,
         status: CorpVpnStatusData,
         dump_path: Option<PathBuf>,
+        logs: LogBuffer,
     }
 
     static STATE: Lazy<Mutex<State>> = Lazy::new(|| {
@@ -139,8 +147,25 @@ mod imp {
             child: None,
             status: CorpVpnStatusData::default(),
             dump_path: None,
+            logs: Arc::new(Mutex::new(VecDeque::new())),
         })
     });
+
+    /// Spawn a task that streams a child's stderr into a capped ring buffer. This
+    /// both feeds the UI log view AND keeps the OS pipe drained so OpenConnect
+    /// never blocks writing stderr once the tunnel is up (it logs periodically).
+    fn spawn_stderr_reader(stderr: tokio::process::ChildStderr, logs: LogBuffer) {
+        tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut buf = logs.lock().await;
+                if buf.len() >= LOG_CAP {
+                    buf.pop_front();
+                }
+                buf.push_back(line);
+            }
+        });
+    }
 
     pub async fn start(req: CorpVpnStartRequest) -> anyhow::Result<CorpVpnStatusData> {
         // One corp tunnel at a time — tear down any previous run first.
@@ -194,6 +219,21 @@ mod imp {
             let _ = stdin.shutdown().await;
         }
 
+        // Continuously drain stderr into a ring buffer for the UI log view (and
+        // so the pipe never fills and stalls OpenConnect once connected).
+        let logs: LogBuffer = Arc::new(Mutex::new(VecDeque::new()));
+        if let Some(stderr) = child.stderr.take() {
+            spawn_stderr_reader(stderr, logs.clone());
+        }
+        let collected_logs = || async {
+            logs.lock()
+                .await
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
         // Race: tunnel-up (dump file appears) vs early process exit (auth/cert).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
         loop {
@@ -210,16 +250,20 @@ mod imp {
                     dns_servers: split.dns_servers,
                     dns_domains: split.dns_domains,
                     full_tunnel: split.full_tunnel,
+                    log_tail: Vec::new(),
                 };
                 let mut st = STATE.lock().await;
                 st.child = Some(child);
                 st.dump_path = Some(dump.clone());
                 st.status = status.clone();
+                st.logs = logs.clone();
                 tracing::info!("corp-vpn: connected, {} route(s)", status.routes.len());
                 return Ok(status);
             }
             if let Ok(Some(exit)) = child.try_wait() {
-                let stderr = drain_stderr(&mut child).await;
+                // Let the reader flush the final lines before we inspect them.
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                let stderr = collected_logs().await;
                 let _ = exit;
                 if req.servercert.trim().is_empty()
                     && let Some(pin) = extract_servercert_pin(&stderr)
@@ -254,19 +298,23 @@ mod imp {
             let _ = tokio::fs::remove_file(p).await;
         }
         st.status = CorpVpnStatusData::default();
+        st.logs.lock().await.clear();
         Ok(())
     }
 
     pub async fn status() -> CorpVpnStatusData {
         let mut st = STATE.lock().await;
-        // If the child died, reflect disconnected.
+        // If the child died, reflect disconnected — but keep the log tail so the
+        // UI can still show why it dropped.
         if let Some(child) = st.child.as_mut()
             && let Ok(Some(_)) = child.try_wait()
         {
             st.child = None;
             st.status = CorpVpnStatusData::default();
         }
-        st.status.clone()
+        let mut status = st.status.clone();
+        status.log_tail = st.logs.lock().await.iter().cloned().collect();
+        status
     }
 
     async fn set_exec(path: &std::path::Path) -> anyhow::Result<()> {
@@ -275,15 +323,6 @@ mod imp {
         perms.set_mode(0o755);
         tokio::fs::set_permissions(path, perms).await?;
         Ok(())
-    }
-
-    async fn drain_stderr(child: &mut tokio::process::Child) -> String {
-        use tokio::io::AsyncReadExt;
-        let mut out = String::new();
-        if let Some(mut err) = child.stderr.take() {
-            let _ = err.read_to_string(&mut out).await;
-        }
-        out
     }
 
     fn tail(s: &str) -> String {
