@@ -210,6 +210,12 @@ mod imp {
         cmd.arg(&req.gateway);
         cmd.stdin(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        // If this handler's future is ever dropped (client disconnect, server
+        // handler-timeout, supersede), kill OpenConnect with it — a leaked
+        // process keeps installing corp routes/DNS and breaks the machine's
+        // normal traffic. Once connected we move the child into STATE, so a live
+        // tunnel is unaffected; only an in-flight/abandoned connect is reaped.
+        cmd.kill_on_drop(true);
 
         let mut child = cmd.spawn()?;
         if let Some(mut stdin) = child.stdin.take() {

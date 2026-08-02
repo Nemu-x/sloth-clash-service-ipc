@@ -256,8 +256,20 @@ async fn init_ipc_state() -> Result<()> {
 
 fn create_ipc_server() -> Result<IpcHttpServer> {
     use crate::IPC_PATH;
+    use kode_bridge::ipc_http_server::ServerConfig;
+    use std::time::Duration;
 
-    let server = IpcHttpServer::new(IPC_PATH)?;
+    // kode-bridge wraps every handler in `write_timeout` (default 10 s). A corp-VPN
+    // connect legitimately runs up to ~35 s (OpenConnect TLS + auth + route push),
+    // so the default would abort /corp/start mid-connect with a 408 and orphan the
+    // OpenConnect process. Give handlers 45 s of headroom; this is a ceiling only —
+    // ordinary handlers still return in milliseconds, and status polls run on
+    // separate connections so they stay snappy during a long connect.
+    let config = ServerConfig {
+        write_timeout: Duration::from_secs(45),
+        ..Default::default()
+    };
+    let server = IpcHttpServer::with_config(IPC_PATH, config)?;
 
     #[cfg(unix)]
     {
