@@ -29,6 +29,8 @@ pub struct CorpSplit {
     pub dns_domains: Vec<String>,
     /// The gateway advertised the default route (0/0) — no split is possible.
     pub full_tunnel: bool,
+    /// Tunnel interface name (from `TUNDEV`), e.g. "utun4".
+    pub tundev: String,
 }
 
 /// parse_vpnc_env turns the `KEY=VALUE` dump the wrapper vpnc-script writes on
@@ -89,6 +91,10 @@ pub fn parse_vpnc_env(dump: &str) -> CorpSplit {
     domains.sort();
     domains.dedup();
     split.dns_domains = domains;
+
+    if let Some(dev) = map.get("TUNDEV") {
+        split.tundev = dev.to_string();
+    }
 
     split
 }
@@ -175,24 +181,30 @@ mod imp {
         if !bin.is_file() {
             anyhow::bail!("openconnect binary not found at {}", req.bin_path);
         }
-        let bundle_dir = bin
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("bad bin_path"))?;
-        let real_script = bundle_dir.join("vpnc-script");
-
         // A per-run scratch dir for the env dump + wrapper script.
         let run_dir = std::env::temp_dir().join(format!("sloth-corp-{}", std::process::id()));
         tokio::fs::create_dir_all(&run_dir).await?;
         let dump = run_dir.join("vpnc-env.dump");
         let _ = tokio::fs::remove_file(&dump).await;
-        let wrapper = run_dir.join("vpnc-wrapper.sh");
+        let wrapper = run_dir.join("vpnc-script.sh");
 
-        // Wrapper: dump the pushed env on tunnel-up, then run the real script so
-        // the corp tunnel's routes/DNS are configured normally.
+        // Teardown-safe model: our vpnc-script brings up the tunnel interface and
+        // NOTHING else — no `route add`, no `scutil`/DNS. That keeps all
+        // persistent system state ours: the service installs corp routes onto the
+        // utun (which the kernel scrubs when the interface dies, even on SIGKILL),
+        // and mihomo owns DNS. So a crash/kill can never leave stale routes or a
+        // stuck resolver behind. See openspec corp-vpn-coexistence design.
         let wrapper_body = format!(
-            "#!/bin/sh\nif [ \"$reason\" = connect ]; then\n  env | grep -E '^(CISCO_SPLIT_INC|INTERNAL_IP4|CISCO_.*DOMAIN|VPNGATEWAY)' > '{dump}'\nfi\nexec '{script}'\n",
+            r#"#!/bin/sh
+case "$reason" in
+  connect|reconnect)
+    /sbin/ifconfig "$TUNDEV" inet "$INTERNAL_IP4_ADDRESS" "$INTERNAL_IP4_ADDRESS" netmask 255.255.255.255 mtu "${{INTERNAL_IP4_MTU:-1400}}" up
+    env | grep -E '^(CISCO_SPLIT_INC|INTERNAL_IP4|CISCO_.*DOMAIN|VPNGATEWAY|TUNDEV)=' > '{dump}'
+    ;;
+esac
+exit 0
+"#,
             dump = dump.display(),
-            script = real_script.display(),
         );
         tokio::fs::write(&wrapper, wrapper_body).await?;
         set_exec(&wrapper).await?;
@@ -248,6 +260,10 @@ mod imp {
                 tokio::time::sleep(Duration::from_millis(150)).await;
                 let dumped = tokio::fs::read_to_string(&dump).await.unwrap_or_default();
                 let split = parse_vpnc_env(&dumped);
+                // We own routing: install each corp subnet onto the tunnel iface.
+                // Interface-scoped routes die with the utun (kernel scrubs them on
+                // process death), so this is self-cleaning even on SIGKILL.
+                install_corp_routes(&split.routes, &split.tundev).await;
                 let status = CorpVpnStatusData {
                     connected: true,
                     needs_cert_trust: false,
@@ -256,6 +272,7 @@ mod imp {
                     dns_servers: split.dns_servers,
                     dns_domains: split.dns_domains,
                     full_tunnel: split.full_tunnel,
+                    tundev: split.tundev,
                     log_tail: Vec::new(),
                 };
                 let mut st = STATE.lock().await;
@@ -263,7 +280,11 @@ mod imp {
                 st.dump_path = Some(dump.clone());
                 st.status = status.clone();
                 st.logs = logs.clone();
-                tracing::info!("corp-vpn: connected, {} route(s)", status.routes.len());
+                tracing::info!(
+                    "corp-vpn: connected on {}, {} route(s)",
+                    status.tundev,
+                    status.routes.len()
+                );
                 return Ok(status);
             }
             if let Ok(Some(exit)) = child.try_wait() {
@@ -296,9 +317,24 @@ mod imp {
 
     pub async fn stop() -> anyhow::Result<()> {
         let mut st = STATE.lock().await;
+        let routes = st.status.routes.clone();
+        let tundev = st.status.tundev.clone();
         if let Some(mut child) = st.child.take() {
+            // Graceful first: SIGTERM lets OpenConnect close the CSTP session with
+            // the gateway cleanly. Give it a moment, then SIGKILL as a backstop.
+            // Either way the utun dies with the process and the kernel scrubs our
+            // interface-scoped routes; the explicit delete below is belt-and-braces.
+            if let Some(pid) = child.id() {
+                unsafe {
+                    platform_lib::kill(pid as platform_lib::pid_t, platform_lib::SIGTERM);
+                }
+                let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
+            }
             let _ = child.start_kill();
             let _ = child.wait().await;
+        }
+        if !tundev.is_empty() {
+            remove_corp_routes(&routes, &tundev).await;
         }
         if let Some(p) = st.dump_path.take() {
             let _ = tokio::fs::remove_file(p).await;
@@ -306,6 +342,42 @@ mod imp {
         st.status = CorpVpnStatusData::default();
         st.logs.lock().await.clear();
         Ok(())
+    }
+
+    /// install_corp_routes points each corp subnet at the tunnel interface. Route
+    /// entries scoped to an interface are removed by the kernel when that
+    /// interface goes away, so they are self-cleaning on any process death.
+    async fn install_corp_routes(routes: &[String], tundev: &str) {
+        if tundev.is_empty() {
+            return;
+        }
+        for r in routes {
+            let out = tokio::process::Command::new("/sbin/route")
+                .args(["-n", "add", "-net", r, "-interface", tundev])
+                .output()
+                .await;
+            match out {
+                Ok(o) if o.status.success() => {
+                    tracing::info!("corp-vpn: route {r} -> {tundev}");
+                }
+                Ok(o) => tracing::warn!(
+                    "corp-vpn: route add {r} failed: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+                Err(e) => tracing::warn!("corp-vpn: route add {r} spawn failed: {e}"),
+            }
+        }
+    }
+
+    /// remove_corp_routes deletes what install_corp_routes added. Best-effort: the
+    /// kernel usually removed them already when the utun died.
+    async fn remove_corp_routes(routes: &[String], tundev: &str) {
+        for r in routes {
+            let _ = tokio::process::Command::new("/sbin/route")
+                .args(["-n", "delete", "-net", r, "-interface", tundev])
+                .output()
+                .await;
+        }
     }
 
     pub async fn status() -> CorpVpnStatusData {
@@ -374,12 +446,14 @@ CISCO_SPLIT_INC_1_ADDR=172.16.0.0
 CISCO_SPLIT_INC_1_MASKLEN=12
 INTERNAL_IP4_DNS=10.16.32.100
 CISCO_DEF_DOMAIN=corp.example
+TUNDEV=utun4
 ";
         let got = parse_vpnc_env(dump);
         assert_eq!(got.routes, vec!["10.0.0.0/8", "172.16.0.0/12"]);
         assert_eq!(got.dns_servers, vec!["10.16.32.100"]);
         assert_eq!(got.dns_domains, vec!["corp.example"]);
         assert!(!got.full_tunnel, "split-tunnel must not be flagged full");
+        assert_eq!(got.tundev, "utun4", "tunnel device must be captured");
     }
 
     #[test]

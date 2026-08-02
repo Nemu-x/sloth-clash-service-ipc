@@ -52,6 +52,11 @@ pub struct CorpVpnStatusData {
     pub dns_servers: Vec<String>,
     pub dns_domains: Vec<String>,
     pub full_tunnel: bool,
+    /// The tunnel interface OpenConnect brought up (e.g. "utun4"). The app binds
+    /// the corp DNS resolver to it (`<resolver>#<tundev>`) so corp-domain queries
+    /// egress the tunnel, and the service installs corp routes onto it.
+    #[serde(default)]
+    pub tundev: String,
     /// Recent OpenConnect stderr lines (most recent last), for the UI log view.
     #[serde(default)]
     pub log_tail: Vec<String>,
