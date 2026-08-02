@@ -152,6 +152,7 @@ mod imp {
         status: CorpVpnStatusData,
         dump_path: Option<PathBuf>,
         logs: LogBuffer,
+        resolver_files: Vec<PathBuf>,
     }
 
     static STATE: Lazy<Mutex<State>> = Lazy::new(|| {
@@ -160,8 +161,84 @@ mod imp {
             status: CorpVpnStatusData::default(),
             dump_path: None,
             logs: Arc::new(Mutex::new(VecDeque::new())),
+            resolver_files: Vec::new(),
         })
     });
+
+    /// Marker written into every /etc/resolver file we create, so a startup
+    /// sweep can find and remove ones a crash left behind.
+    const RESOLVER_MARKER: &str = "# managed-by: sloth-corp";
+
+    /// Point the system resolver at the corp DNS for corp domains, via macOS
+    /// `/etc/resolver/<domain>` files. This is REQUIRED because a machine whose
+    /// system DNS is the local router (192.168.x) never reaches mihomo for these
+    /// names, so corp hostnames would resolve nowhere. The corp resolver is
+    /// reachable through the tunnel (its subnet is routed to the utun). The
+    /// gateway host gets a MORE-specific file pointing at public DNS so it never
+    /// resolves via the corp resolver (which would deadlock the next connect).
+    /// Returns the files created, for deterministic teardown.
+    async fn configure_corp_dns(
+        domains: &[String],
+        servers: &[String],
+        gateway: &str,
+    ) -> Vec<PathBuf> {
+        let mut created = Vec::new();
+        if servers.is_empty() {
+            return created;
+        }
+        let _ = tokio::fs::create_dir_all("/etc/resolver").await;
+        let ns: String = servers
+            .iter()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| format!("nameserver {}\n", s.trim()))
+            .collect();
+        for d in domains {
+            let d = d.trim();
+            if d.is_empty() {
+                continue;
+            }
+            let path = PathBuf::from(format!("/etc/resolver/{d}"));
+            if tokio::fs::write(&path, format!("{RESOLVER_MARKER}\n{ns}"))
+                .await
+                .is_ok()
+            {
+                created.push(path);
+            }
+        }
+        let gw = gateway.trim();
+        if !gw.is_empty() && gw.parse::<std::net::IpAddr>().is_err() {
+            let path = PathBuf::from(format!("/etc/resolver/{gw}"));
+            let body = format!("{RESOLVER_MARKER}\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n");
+            if tokio::fs::write(&path, body).await.is_ok() {
+                created.push(path);
+            }
+        }
+        created
+    }
+
+    async fn clear_corp_dns(files: &[PathBuf]) {
+        for f in files {
+            let _ = tokio::fs::remove_file(f).await;
+        }
+    }
+
+    /// Remove any resolver files we left behind (identified by RESOLVER_MARKER) —
+    /// e.g. after a hard kill. Corp-domain-scoped, so it never touches unrelated
+    /// resolver entries.
+    async fn sweep_corp_dns() {
+        let mut dir = match tokio::fs::read_dir("/etc/resolver").await {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            let p = entry.path();
+            if let Ok(body) = tokio::fs::read_to_string(&p).await
+                && body.contains(RESOLVER_MARKER)
+            {
+                let _ = tokio::fs::remove_file(&p).await;
+            }
+        }
+    }
 
     /// Spawn a task that streams a child's stderr into a capped ring buffer. This
     /// both feeds the UI log view AND keeps the OS pipe drained so OpenConnect
@@ -180,8 +257,11 @@ mod imp {
     }
 
     pub async fn start(req: CorpVpnStartRequest) -> anyhow::Result<CorpVpnStatusData> {
-        // One corp tunnel at a time — tear down any previous run first.
+        // One corp tunnel at a time — tear down any previous run first, and sweep
+        // any resolver files a previous crash may have left behind so a stale corp
+        // domain override never lingers.
         stop().await.ok();
+        sweep_corp_dns().await;
 
         let bin = PathBuf::from(&req.bin_path);
         if !bin.is_file() {
@@ -274,6 +354,9 @@ exit 0
                 // Interface-scoped routes die with the utun (kernel scrubs them on
                 // process death), so this is self-cleaning even on SIGKILL.
                 install_corp_routes(&split.routes, &split.tundev).await;
+                // Make corp domains resolvable system-wide (see configure_corp_dns).
+                let resolver_files =
+                    configure_corp_dns(&split.dns_domains, &split.dns_servers, &req.gateway).await;
                 let status = CorpVpnStatusData {
                     connected: true,
                     needs_cert_trust: false,
@@ -291,6 +374,7 @@ exit 0
                 st.dump_path = Some(dump.clone());
                 st.status = status.clone();
                 st.logs = logs.clone();
+                st.resolver_files = resolver_files;
                 tracing::info!(
                     "corp-vpn: connected on {}, {} route(s)",
                     status.tundev,
@@ -330,6 +414,8 @@ exit 0
         let mut st = STATE.lock().await;
         let routes = st.status.routes.clone();
         let tundev = st.status.tundev.clone();
+        let resolver_files = std::mem::take(&mut st.resolver_files);
+        clear_corp_dns(&resolver_files).await;
         if let Some(mut child) = st.child.take() {
             // Graceful first: SIGTERM lets OpenConnect close the CSTP session with
             // the gateway cleanly. Give it a moment, then SIGKILL as a backstop.
@@ -406,6 +492,12 @@ exit 0
         status
     }
 
+    /// Boot-time cleanup: drop any resolver files a previous (crashed) run left,
+    /// so a stale corp-domain override can't linger after the service restarts.
+    pub async fn sweep_orphans() {
+        sweep_corp_dns().await;
+    }
+
     async fn set_exec(path: &std::path::Path) -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let mut perms = tokio::fs::metadata(path).await?.permissions();
@@ -434,10 +526,11 @@ mod imp {
     pub async fn status() -> CorpVpnStatusData {
         CorpVpnStatusData::default()
     }
+    pub async fn sweep_orphans() {}
 }
 
 #[cfg(feature = "standalone")]
-pub use imp::{start, status, stop};
+pub use imp::{start, status, stop, sweep_orphans};
 
 #[cfg(test)]
 mod tests {

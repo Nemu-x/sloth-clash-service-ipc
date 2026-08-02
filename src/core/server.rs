@@ -14,6 +14,9 @@ pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
     make_ipc_dir().await?;
     cleanup_stale_ipc_socket().await?;
     init_ipc_state().await?;
+    // Reap any corp-VPN resolver overrides a previous crashed run left behind, so
+    // a stale corp-domain DNS entry never survives a service restart.
+    super::corp_vpn::sweep_orphans().await;
 
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let (done_tx, done_rx) = oneshot::channel::<()>();
