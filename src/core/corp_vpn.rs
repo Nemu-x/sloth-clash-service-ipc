@@ -199,7 +199,11 @@ mod imp {
 case "$reason" in
   connect|reconnect)
     /sbin/ifconfig "$TUNDEV" inet "$INTERNAL_IP4_ADDRESS" "$INTERNAL_IP4_ADDRESS" netmask 255.255.255.255 mtu "${{INTERNAL_IP4_MTU:-1400}}" up
-    env | grep -E '^(CISCO_SPLIT_INC|INTERNAL_IP4|CISCO_.*DOMAIN|VPNGATEWAY|TUNDEV)=' > '{dump}'
+    # Prefix match, NO trailing '=': the interesting keys are indexed subkeys
+    # (CISCO_SPLIT_INC_0_ADDR, INTERNAL_IP4_DNS, ...). Anchoring '=' right after
+    # the prefix would only catch the bare counter (CISCO_SPLIT_INC=N) and drop
+    # the actual routes/DNS → the parser sees no split → false "full tunnel".
+    env | grep -E '^(CISCO_SPLIT_INC|INTERNAL_IP4|CISCO_.*DOMAIN|VPNGATEWAY|TUNDEV)' > '{dump}'
     ;;
 esac
 exit 0
