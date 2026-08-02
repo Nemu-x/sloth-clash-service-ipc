@@ -240,6 +240,136 @@ mod imp {
         }
     }
 
+    // --- Search domains -----------------------------------------------------
+    // The /etc/resolver files only route queries FOR a corp domain; a BARE host
+    // like "srv-01" needs the corp domain in the system SEARCH list so it becomes
+    // "srv-01.corp.example" and then matches the resolver. We set the corp search
+    // domains on the primary network service (via networksetup) and back up the
+    // originals to a file so a crash can be recovered deterministically.
+
+    const SEARCH_BACKUP: &str = "/var/db/sloth-corp/searchdomains.bak";
+
+    /// The network service carrying the default route (e.g. "Wi-Fi"), which owns
+    /// the resolver search list. Maps the default-route interface to its service
+    /// name via `networksetup -listnetworkserviceorder`.
+    async fn primary_network_service() -> Option<String> {
+        let iface = {
+            let out = tokio::process::Command::new("/sbin/route")
+                .args(["-n", "get", "default"])
+                .output()
+                .await
+                .ok()?;
+            String::from_utf8_lossy(&out.stdout).lines().find_map(|l| {
+                l.trim()
+                    .strip_prefix("interface:")
+                    .map(|s| s.trim().to_string())
+            })?
+        };
+        let out = tokio::process::Command::new("/usr/sbin/networksetup")
+            .arg("-listnetworkserviceorder")
+            .output()
+            .await
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let needle = format!("Device: {iface})");
+        let mut service = String::new();
+        for line in text.lines() {
+            let l = line.trim();
+            if l.starts_with('(')
+                && let Some(close) = l.find(") ")
+                && l[1..close].chars().all(|c| c.is_ascii_digit())
+            {
+                service = l[close + 2..].trim().to_string();
+                continue;
+            }
+            if l.contains(&needle) && !service.is_empty() {
+                return Some(service);
+            }
+        }
+        None
+    }
+
+    async fn get_search_domains(service: &str) -> Vec<String> {
+        let out = match tokio::process::Command::new("/usr/sbin/networksetup")
+            .args(["-getsearchdomains", service])
+            .output()
+            .await
+        {
+            Ok(o) => o,
+            Err(_) => return Vec::new(),
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        if text.contains("aren't any") {
+            return Vec::new();
+        }
+        text.lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    async fn set_search_domains(service: &str, domains: &[String]) {
+        let mut cmd = tokio::process::Command::new("/usr/sbin/networksetup");
+        cmd.arg("-setsearchdomains").arg(service);
+        if domains.is_empty() {
+            cmd.arg("empty");
+        } else {
+            for d in domains {
+                cmd.arg(d);
+            }
+        }
+        let _ = cmd.output().await;
+    }
+
+    /// Prepend the corp search domains to the primary service's list so bare corp
+    /// hostnames resolve. Backs up the originals first for deterministic restore.
+    async fn configure_corp_search_domains(domains: &[String]) {
+        let domains: Vec<String> = domains
+            .iter()
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty())
+            .collect();
+        if domains.is_empty() {
+            return;
+        }
+        let Some(service) = primary_network_service().await else {
+            return;
+        };
+        let original = get_search_domains(&service).await;
+        let _ = tokio::fs::create_dir_all("/var/db/sloth-corp").await;
+        let backup = format!("{service}\n{}", original.join("\n"));
+        let _ = tokio::fs::write(SEARCH_BACKUP, backup).await;
+        let mut combined = domains;
+        for d in &original {
+            if !combined.contains(d) {
+                combined.push(d.clone());
+            }
+        }
+        set_search_domains(&service, &combined).await;
+        tracing::info!("corp-vpn: set search domains on {service}");
+    }
+
+    /// Restore the pre-corp search domains from the backup (deterministic teardown;
+    /// also self-heals after a crash). No-op when no backup exists.
+    async fn restore_corp_search_domains() {
+        let body = match tokio::fs::read_to_string(SEARCH_BACKUP).await {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let mut lines = body.lines();
+        let Some(service) = lines.next().map(|s| s.trim().to_string()) else {
+            return;
+        };
+        if !service.is_empty() {
+            let original: Vec<String> = lines
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect();
+            set_search_domains(&service, &original).await;
+        }
+        let _ = tokio::fs::remove_file(SEARCH_BACKUP).await;
+    }
+
     /// Spawn a task that streams a child's stderr into a capped ring buffer. This
     /// both feeds the UI log view AND keeps the OS pipe drained so OpenConnect
     /// never blocks writing stderr once the tunnel is up (it logs periodically).
@@ -357,6 +487,8 @@ exit 0
                 // Make corp domains resolvable system-wide (see configure_corp_dns).
                 let resolver_files =
                     configure_corp_dns(&split.dns_domains, &split.dns_servers, &req.gateway).await;
+                // Search domains so BARE corp hostnames (e.g. "srv-01") resolve.
+                configure_corp_search_domains(&split.dns_domains).await;
                 let status = CorpVpnStatusData {
                     connected: true,
                     needs_cert_trust: false,
@@ -416,6 +548,7 @@ exit 0
         let tundev = st.status.tundev.clone();
         let resolver_files = std::mem::take(&mut st.resolver_files);
         clear_corp_dns(&resolver_files).await;
+        restore_corp_search_domains().await;
         if let Some(mut child) = st.child.take() {
             // Graceful first: SIGTERM lets OpenConnect close the CSTP session with
             // the gateway cleanly. Give it a moment, then SIGKILL as a backstop.
@@ -495,6 +628,7 @@ exit 0
     /// Boot-time cleanup: drop any resolver files a previous (crashed) run left,
     /// so a stale corp-domain override can't linger after the service restarts.
     pub async fn sweep_orphans() {
+        restore_corp_search_domains().await;
         sweep_corp_dns().await;
     }
 
