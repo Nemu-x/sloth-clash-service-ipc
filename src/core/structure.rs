@@ -57,6 +57,12 @@ pub struct CorpVpnStatusData {
     /// egress the tunnel, and the service installs corp routes onto it.
     #[serde(default)]
     pub tundev: String,
+    /// The gateway's public IP (`VPNGATEWAY`). The app excludes it from mihomo's
+    /// TUN so OpenConnect's OWN traffic to the gateway goes out the physical NIC
+    /// instead of looping through the proxy — otherwise DTLS/CSTP to the gateway
+    /// runs over the proxy and the corp tunnel flaps (DPD dead peer).
+    #[serde(default)]
+    pub gateway_ip: String,
     /// Recent OpenConnect stderr lines (most recent last), for the UI log view.
     #[serde(default)]
     pub log_tail: Vec<String>,

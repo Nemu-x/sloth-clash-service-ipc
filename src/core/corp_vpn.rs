@@ -6,12 +6,13 @@
 //! through mihomo (which excludes those subnets). Only the SYSTEM/root service
 //! can bring up the corp tun and configure its routes.
 //!
-//! The route/DNS learning uses a **wrapper vpnc-script**: OpenConnect runs it on
-//! tunnel-up with the pushed config in the environment (CISCO_SPLIT_INC_* etc.);
-//! the wrapper dumps that env to a file and then execs the real bundled
-//! vpnc-script so the corp tunnel's own routes/DNS are still configured. The
-//! service reads the dump and reports it. [`parse_vpnc_env`] is that parser —
-//! pure and fully unit-tested against a real gateway's shape.
+//! Teardown-safe model: our vpnc-script brings up the tunnel interface ONLY and
+//! dumps the pushed config (CISCO_SPLIT_INC_* etc.) to a file — it never touches
+//! routes or system DNS. The service then installs corp routes onto the utun
+//! itself (the kernel scrubs them when the interface dies, so nothing leaks on
+//! SIGKILL), and mihomo owns DNS. [`parse_vpnc_env`] is the dump parser — pure
+//! and unit-tested against a real gateway's shape. See openspec design
+//! "Routing & DNS ownership" for why this is crash-safe by construction.
 
 use std::collections::HashMap;
 
@@ -31,6 +32,8 @@ pub struct CorpSplit {
     pub full_tunnel: bool,
     /// Tunnel interface name (from `TUNDEV`), e.g. "utun4".
     pub tundev: String,
+    /// Gateway public IP (from `VPNGATEWAY`) — excluded from mihomo's TUN.
+    pub gateway_ip: String,
 }
 
 /// parse_vpnc_env turns the `KEY=VALUE` dump the wrapper vpnc-script writes on
@@ -94,6 +97,9 @@ pub fn parse_vpnc_env(dump: &str) -> CorpSplit {
 
     if let Some(dev) = map.get("TUNDEV") {
         split.tundev = dev.to_string();
+    }
+    if let Some(gw) = map.get("VPNGATEWAY") {
+        split.gateway_ip = gw.to_string();
     }
 
     split
@@ -277,6 +283,7 @@ exit 0
                     dns_domains: split.dns_domains,
                     full_tunnel: split.full_tunnel,
                     tundev: split.tundev,
+                    gateway_ip: split.gateway_ip,
                     log_tail: Vec::new(),
                 };
                 let mut st = STATE.lock().await;
@@ -458,6 +465,10 @@ TUNDEV=utun4
         assert_eq!(got.dns_domains, vec!["corp.example"]);
         assert!(!got.full_tunnel, "split-tunnel must not be flagged full");
         assert_eq!(got.tundev, "utun4", "tunnel device must be captured");
+        assert_eq!(
+            got.gateway_ip, "203.0.113.10",
+            "gateway IP must be captured"
+        );
     }
 
     #[test]
