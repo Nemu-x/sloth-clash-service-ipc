@@ -108,8 +108,12 @@ jobs:
           git clone --depth 1 --branch v9.12 https://gitlab.com/openconnect/openconnect.git ocsrc
           cd ocsrc
           ./autogen.sh
+          # GCC 14 (MSYS2) promotes -Wincompatible-pointer-types to an error; a
+          # few Windows getsockopt/ioctl calls in v9.12 trip it (ABI-safe int* vs
+          # char*), so demote it back to a warning for this build.
           ./configure --disable-nls --with-gnutls --without-openssl \
-            --with-vpnc-script=vpnc-script-win.js
+            --with-vpnc-script=vpnc-script-win.js \
+            CFLAGS="-O2 -g -Wno-error=incompatible-pointer-types -Wno-error=int-conversion"
           make -j$(nproc)
           # mingw builds the exe in-tree (or under .libs); find it.
           find . -name 'openconnect.exe' -print
