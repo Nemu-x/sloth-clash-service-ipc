@@ -161,38 +161,44 @@ jobs:
           find . -name 'openconnect.exe' -print
       - name: Assemble relocatable bundle (exe + full DLL closure + wintun)
         run: |
-          set -euo pipefail
+          # NOTE: deliberately no `set -e`/pipefail below — a leaf DLL whose ldd has
+          # no further $MINGW_PREFIX deps makes grep exit 1, which under -e+pipefail
+          # aborted the closure mid-way and shipped/failed on an incomplete bundle.
+          set -uo pipefail
           mkdir -p bundle
-          exe="$(find ocsrc -name 'openconnect.exe' | head -n1)"
+          exe="$(find ocsrc -name 'openconnect.exe' -print -quit)"
+          [ -n "$exe" ] || { echo "FAIL: openconnect.exe not found"; exit 1; }
           cp "$exe" bundle/openconnect.exe
           # The OpenConnect shared library is built in-tree (.libs), NOT under
           # $MINGW_PREFIX, so ldd can't find it to recurse — copy it explicitly.
-          liboc="$(find ocsrc -name 'libopenconnect-5.dll' | head -n1)"
+          liboc="$(find ocsrc -name 'libopenconnect-5.dll' -print -quit)"
+          [ -n "$liboc" ] || { echo "FAIL: libopenconnect-5.dll not built"; find ocsrc -name '*.dll'; exit 1; }
           cp "$liboc" bundle/
-          # Resolve the FULL transitive DLL closure: with bundle/ on PATH so ldd
-          # finds the in-tree lib and recurses, repeatedly pull every $MINGW_PREFIX
-          # dep into bundle/ until the set stops growing. A single ldd pass on the
-          # bare exe missed nettle/gmp/p11-kit/idn2/zlib/… and shipped a bundle that
-          # died with "libopenconnect-5.dll: cannot open shared object file".
+          # Full transitive DLL closure: with bundle/ on PATH so ldd resolves the
+          # in-tree lib and recurses, pull every $MINGW_PREFIX dep into bundle/,
+          # iterating until no new DLL appears (grep no-match is expected, hence
+          # `|| true`).
           export PATH="$PWD/bundle:$PATH"
-          while :; do
-            before=$(ls -1 bundle | wc -l)
+          for pass in 1 2 3 4 5 6 7 8; do
+            new=0
             for f in bundle/*.exe bundle/*.dll; do
-              ldd "$f" 2>/dev/null | grep -F "=> $MINGW_PREFIX/" | awk '{print $3}'
-            done | sort -u | while read -r dll; do
-              [ -f "bundle/$(basename "$dll")" ] || cp "$dll" bundle/
+              deps="$(ldd "$f" 2>/dev/null | grep -F "=> $MINGW_PREFIX/" | awk '{print $3}' || true)"
+              for dll in $deps; do
+                base="$(basename "$dll")"
+                if [ ! -f "bundle/$base" ]; then cp "$dll" bundle/ && new=1; fi
+              done
             done
-            after=$(ls -1 bundle | wc -l)
-            [ "$before" = "$after" ] && break
+            echo "closure pass $pass -> $(ls -1 bundle | wc -l) files"
+            [ "$new" -eq 0 ] && break
           done
           # wintun.dll — OpenConnect uses it for the tunnel adapter on Windows.
-          curl -fsSLO https://www.wintun.net/builds/wintun-0.14.1.zip
+          curl -fsSLO https://www.wintun.net/builds/wintun-0.14.1.zip || { echo "FAIL: wintun download"; exit 1; }
           unzip -j wintun-0.14.1.zip 'wintun/bin/amd64/wintun.dll' -d bundle/
+          echo "--- bundle contents ---"; ls -1 bundle/
           # Never ship a broken bundle: fail loudly if anything is still unresolved.
           if ldd bundle/openconnect.exe | grep -i 'not found'; then
             echo "FAIL: unresolved DLL in bundle"; exit 1
           fi
-          echo "--- bundle contents ---"; ls -1 bundle/
       - name: Package + hash + publish
         shell: bash
         env:
@@ -262,33 +268,38 @@ jobs:
           find . -name 'openconnect.exe' -print
       - name: Assemble relocatable bundle (exe + full DLL closure + wintun)
         run: |
-          set -euo pipefail
+          # No `set -e`/pipefail in the closure (grep no-match exits 1 legitimately).
+          set -uo pipefail
           mkdir -p bundle
-          exe="$(find ocsrc -name 'openconnect.exe' | head -n1)"
+          exe="$(find ocsrc -name 'openconnect.exe' -print -quit)"
+          [ -n "$exe" ] || { echo "FAIL: openconnect.exe not found"; exit 1; }
           cp "$exe" bundle/openconnect.exe
           # libopenconnect-5.dll is built in-tree (.libs), not under $MINGW_PREFIX
           # (/clangarm64 here), so ldd can't find it to recurse — copy it first.
-          liboc="$(find ocsrc -name 'libopenconnect-5.dll' | head -n1)"
+          liboc="$(find ocsrc -name 'libopenconnect-5.dll' -print -quit)"
+          [ -n "$liboc" ] || { echo "FAIL: libopenconnect-5.dll not built"; find ocsrc -name '*.dll'; exit 1; }
           cp "$liboc" bundle/
-          # Full transitive DLL closure (same fixpoint as the amd64 job); with
-          # bundle/ on PATH so ldd resolves the in-tree lib and recurses.
+          # Full transitive DLL closure (same as the amd64 job); bundle/ on PATH so
+          # ldd resolves the in-tree lib and recurses.
           export PATH="$PWD/bundle:$PATH"
-          while :; do
-            before=$(ls -1 bundle | wc -l)
+          for pass in 1 2 3 4 5 6 7 8; do
+            new=0
             for f in bundle/*.exe bundle/*.dll; do
-              ldd "$f" 2>/dev/null | grep -F "=> $MINGW_PREFIX/" | awk '{print $3}'
-            done | sort -u | while read -r dll; do
-              [ -f "bundle/$(basename "$dll")" ] || cp "$dll" bundle/
+              deps="$(ldd "$f" 2>/dev/null | grep -F "=> $MINGW_PREFIX/" | awk '{print $3}' || true)"
+              for dll in $deps; do
+                base="$(basename "$dll")"
+                if [ ! -f "bundle/$base" ]; then cp "$dll" bundle/ && new=1; fi
+              done
             done
-            after=$(ls -1 bundle | wc -l)
-            [ "$before" = "$after" ] && break
+            echo "closure pass $pass -> $(ls -1 bundle | wc -l) files"
+            [ "$new" -eq 0 ] && break
           done
-          curl -fsSLO https://www.wintun.net/builds/wintun-0.14.1.zip
+          curl -fsSLO https://www.wintun.net/builds/wintun-0.14.1.zip || { echo "FAIL: wintun download"; exit 1; }
           unzip -j wintun-0.14.1.zip 'wintun/bin/arm64/wintun.dll' -d bundle/
+          echo "--- bundle contents ---"; ls -1 bundle/
           if ldd bundle/openconnect.exe | grep -i 'not found'; then
             echo "FAIL: unresolved DLL in bundle"; exit 1
           fi
-          echo "--- bundle contents ---"; ls -1 bundle/
       - name: Package + hash + publish
         shell: bash
         env:
