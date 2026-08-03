@@ -37,6 +37,15 @@ pub struct CorpVpnStartRequest {
     pub servercert: String,
 }
 
+/// Request to install the TAP-Windows driver (Windows only). `driver_dir` is the
+/// directory the app unpacked the SHA-verified tap-windows component into — it
+/// holds the signed `tapinstall.exe` + `OemVista.inf` + `tap0901.sys/.cat`. The
+/// service verifies the installer's signature before running it as SYSTEM.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct CorpEnsureDriverRequest {
+    pub driver_dir: String,
+}
+
 /// Corporate-VPN state reported back to the app. On a first connect against an
 /// untrusted certificate, `needs_cert_trust` is true and `servercert_sha256`
 /// carries the fingerprint to show the user. On success, `routes`/`dns_*` are

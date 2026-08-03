@@ -2,7 +2,7 @@ use super::state::IpcState;
 use crate::core::auth::ipc_request_context_to_auth_context;
 use crate::core::logger::set_or_update_writer;
 use crate::core::manager::{CORE_MANAGER, LOGGER_MANAGER};
-use crate::core::structure::{CorpVpnStartRequest, Response};
+use crate::core::structure::{CorpEnsureDriverRequest, CorpVpnStartRequest, Response};
 use crate::{ClashConfig, IpcCommand, VERSION, WriterConfig};
 use http::StatusCode;
 use kode_bridge::{IpcHttpServer, Result, Router, ipc_http_server::HttpResponse};
@@ -501,6 +501,34 @@ fn create_ipc_router() -> Result<Router> {
                     data: Some(data),
                 })?
                 .build())
+        })
+        .post(IpcCommand::EnsureCorpDriver.as_ref(), |ctx| async move {
+            trace!("Received EnsureCorpDriver command");
+            ipc_request_context_to_auth_context(&ctx)?;
+            match ctx.json::<CorpEnsureDriverRequest>() {
+                Ok(req) => match super::corp_vpn::ensure_driver(req).await {
+                    Ok(_) => Ok(HttpResponse::builder()
+                        .status(StatusCode::OK)
+                        .json(&Response::<()> {
+                            code: 0,
+                            message: "Success".to_string(),
+                            data: None,
+                        })?
+                        .build()),
+                    Err(e) => Ok(HttpResponse::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .json(&Response::<()> {
+                            code: 1,
+                            message: format!("ensure corp driver: {e}"),
+                            data: None,
+                        })?
+                        .build()),
+                },
+                Err(e) => Ok(HttpResponse::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .text(format!("Invalid JSON: {e}"))
+                    .build()),
+            }
         });
     Ok(router)
 }
