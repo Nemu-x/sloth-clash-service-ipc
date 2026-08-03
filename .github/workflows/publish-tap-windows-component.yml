@@ -68,6 +68,9 @@ jobs:
       - name: Package + hash + publish
         env:
           GH_TOKEN: ${{ github.token }}
+          # No actions/checkout in this job, so tell gh the repo explicitly
+          # instead of inferring it from a git remote (which isn't there).
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           echo "--- bundle contents ---"; ls -1 bundle/
