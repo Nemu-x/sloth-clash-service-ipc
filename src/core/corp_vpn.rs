@@ -110,16 +110,36 @@ pub fn parse_vpnc_env(dump: &str) -> CorpSplit {
     split
 }
 
-/// extract_servercert_pin scans OpenConnect's stderr for the SHA-256 fingerprint
-/// it prints when a server certificate is not yet trusted, returning the value
-/// to pin (`sha256:<hex>`). Trust-on-first-use: the app shows it to the user,
-/// then reconnects with it pinned. Best-effort text parsing.
+/// extract_servercert_pin scans OpenConnect's stderr for the certificate pin it
+/// prints when a server certificate is not yet trusted, returning the value to
+/// pass back via `--servercert`. Trust-on-first-use: the app shows it to the
+/// user, then reconnects with it pinned. Best-effort text parsing.
+///
+/// The wire format depends on OpenConnect's crypto backend, and BOTH occur in
+/// this project:
+///   - GnuTLS (our from-source Windows bundle): `--servercert pin-sha256:<base64>`
+///   - OpenSSL (macOS Homebrew build):          `--servercert sha256:<hex>`
+/// `--servercert` accepts either verbatim, so we return whichever we find. The
+/// base64 form must be matched FIRST — it contains the substring "sha256:" that
+/// the hex branch would otherwise try (and fail) to parse.
 #[allow(dead_code)]
 pub fn extract_servercert_pin(stderr: &str) -> Option<String> {
     for line in stderr.lines() {
-        // OpenConnect prints e.g. `--servercert sha256:ABCD...` as the hint, and
-        // `SHA256:ABCD...` in the fingerprint block.
-        if let Some(idx) = line.to_ascii_lowercase().find("sha256:") {
+        let lower = line.to_ascii_lowercase();
+        // GnuTLS: `pin-sha256:<base64>` (e.g. `pin-sha256:MCDJ...FCI=`).
+        if let Some(idx) = lower.find("pin-sha256:") {
+            let rest = &line[idx + "pin-sha256:".len()..];
+            let b64: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
+                .collect();
+            // A 32-byte SHA-256 digest is 44 base64 chars incl. the '=' pad.
+            if b64.len() >= 43 {
+                return Some(format!("pin-sha256:{b64}"));
+            }
+        }
+        // OpenSSL: `sha256:<hex>`.
+        if let Some(idx) = lower.find("sha256:") {
             let rest = &line[idx + "sha256:".len()..];
             let hex: String = rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
             if hex.len() >= 32 {
@@ -1000,6 +1020,15 @@ CISCO_SPLIT_DNS=corp.example,sub.corp.example
         let pin = extract_servercert_pin(stderr).expect("should find a pin");
         assert!(pin.starts_with("sha256:"));
         assert_eq!(pin.len(), "sha256:".len() + 64);
+    }
+
+    #[test]
+    fn extracts_gnutls_base64_pin() {
+        // GnuTLS builds (our Windows bundle) print the base64 `pin-sha256:` form.
+        // Real line shape from a self-signed corp gateway.
+        let stderr = "Certificate from VPN server \"vpn.example\" failed verification.\nReason: signer not found\nTo trust this server in future, perhaps add this to your command line:\n    --servercert pin-sha256:MCDJgwuGvXvv80C45Q2mYbX4C334x7+82GyRERoyFCI= to trust\n";
+        let pin = extract_servercert_pin(stderr).expect("should find a base64 pin");
+        assert_eq!(pin, "pin-sha256:MCDJgwuGvXvv80C45Q2mYbX4C334x7+82GyRERoyFCI=");
     }
 
     #[test]
