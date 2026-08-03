@@ -45,13 +45,24 @@ jobs:
       TAP_INSTALLER: tap-windows-9.24.7-I601-Win10.exe
       TAP_INSTALLER_SHA256: 1c44e77ab148ddfb174de8041100efc38c4f23500183faff88f9badac5782e3c
     steps:
+      # Download + verify + extract in PWSH (native console). Running 7-Zip under
+      # MSYS bash makes it die with "Break signaled" (bash forwards a spurious
+      # CTRL-break to the native exe); a native shell has no such issue.
       - name: Fetch + verify + extract OpenVPN signed tap-windows6
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          curl.exe -fsSLO "https://build.openvpn.net/downloads/releases/$env:TAP_INSTALLER"
+          $got = (Get-FileHash -Algorithm SHA256 $env:TAP_INSTALLER).Hash.ToLower()
+          if ($got -ne $env:TAP_INSTALLER_SHA256) { throw "sha256 mismatch: $got != $env:TAP_INSTALLER_SHA256" }
+          & 'C:\Program Files\7-Zip\7z.exe' x -oextracted "$env:TAP_INSTALLER" > $null
+          if ($LASTEXITCODE -ne 0) { throw "7z extract failed: exit $LASTEXITCODE" }
+          Get-ChildItem -Recurse extracted\driver, extracted\bin | Select-Object FullName
+      - name: Package + hash + publish
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          SZ="/c/Program Files/7-Zip/7z.exe"
-          curl -fsSLO "https://build.openvpn.net/downloads/releases/${TAP_INSTALLER}"
-          echo "${TAP_INSTALLER_SHA256}  ${TAP_INSTALLER}" | sha256sum -c -
-          "$SZ" x -oextracted "${TAP_INSTALLER}" >/dev/null
           mkdir -p bundle
           # Flat layout (verified): driver/{OemVista.inf,tap0901.sys,tap0901.cat}
           # + bin/tapinstall.exe. All WHQL/OpenVPN-signed; ship them verbatim.
@@ -60,11 +71,6 @@ jobs:
           cp extracted/driver/tap0901.cat  bundle/
           cp extracted/bin/tapinstall.exe  bundle/
           echo "--- bundle contents ---"; ls -1 bundle/
-      - name: Package + hash + publish
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
           asset="tap-windows-amd64.tar.gz"
           tar -czf "$asset" -C bundle .
           sha=$(sha256sum "$asset" | awk '{print $1}')
