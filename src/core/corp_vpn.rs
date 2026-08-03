@@ -119,6 +119,7 @@ pub fn parse_vpnc_env(dump: &str) -> CorpSplit {
 /// this project:
 ///   - GnuTLS (our from-source Windows bundle): `--servercert pin-sha256:<base64>`
 ///   - OpenSSL (macOS Homebrew build):          `--servercert sha256:<hex>`
+///
 /// `--servercert` accepts either verbatim, so we return whichever we find. The
 /// base64 form must be matched FIRST — it contains the substring "sha256:" that
 /// the hex branch would otherwise try (and fail) to parse.
