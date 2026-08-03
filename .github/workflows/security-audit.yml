@@ -1,0 +1,51 @@
+# Security gating for the privileged IPC service — this is the SYSTEM/root
+# component (spawns the core, installs the corp TAP driver, owns routes/DNS), so a
+# vulnerable dependency here is the highest-impact supply-chain risk in the whole
+# project. Mirrors the desktop repo's security-audit.yml.
+#
+#   - cargo audit: RustSec advisory DB — fails on known-vulnerable dependencies.
+#   - cargo deny:  supply-chain hygiene — yanked crates, duplicate versions, and
+#                  non-crates.io sources (advisories double-checked as defence in
+#                  depth). Runs against deny.toml.
+name: Security audit
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - dev
+  schedule:
+    - cron: '0 6 * * 1' # weekly, Monday 06:00 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-audit:
+    name: cargo audit (RustSec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: cargo audit
+        run: cargo audit
+
+  cargo-deny:
+    name: cargo deny (supply chain)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo deny check
+        run: cargo deny check advisories bans sources

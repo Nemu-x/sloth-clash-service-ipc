@@ -1,0 +1,19 @@
+# Supply-chain policy for the privileged IPC service (cargo-deny).
+# Scope: advisories (RustSec), bans (duplicate/yanked crates), sources (origins).
+# Licenses are intentionally NOT gated here yet — that's a separate policy call.
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# The only first-party git dependency (clash-verge-rev's logger).
+allow-git = [
+  "https://github.com/clash-verge-rev/clash-verge-logger.git",
+]
