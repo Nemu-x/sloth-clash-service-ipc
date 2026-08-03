@@ -787,15 +787,134 @@ WScript.Quit(0);
                 }
             }
 
-            // TODO(P2): NRPT rules for corp domains → corp resolver via PowerShell
-            // (Add-DnsClientNrptRule -Namespace ".corp" -NameServers <ip>), plus a
-            // deterministic removal + startup sweep. Interface bring-up may also
-            // need `netsh interface ip set address` if wintun doesn't self-assign.
-            pub async fn setup_dns(_domains: &[String], _servers: &[String], _gateway: &str) {
-                tracing::warn!("corp-vpn: Windows DNS (NRPT) wiring not implemented yet (P2)");
+            // Corp DNS on Windows = NRPT (Name Resolution Policy Table): per-domain
+            // rules routing corp namespaces to the corp resolver, plus the corp
+            // domains added to the global suffix search list so BARE hostnames
+            // resolve. We record what we added (a file of namespaces + a suffix
+            // backup) so teardown/sweep is deterministic even after a crash.
+            const WIN_STATE_DIR: &str = r"C:\ProgramData\sloth-corp";
+            const WIN_NRPT_NS: &str = r"C:\ProgramData\sloth-corp\nrpt-namespaces.txt";
+            const WIN_SUFFIX_BACKUP: &str = r"C:\ProgramData\sloth-corp\suffix-backup.txt";
+
+            async fn powershell(script: &str) -> Option<String> {
+                let out = tokio::process::Command::new("powershell")
+                    .args(["-NoProfile", "-NonInteractive", "-Command", script])
+                    .output()
+                    .await
+                    .ok()?;
+                Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
             }
-            pub async fn teardown_dns() {}
-            pub async fn sweep() {}
+
+            pub async fn setup_dns(domains: &[String], servers: &[String], gateway: &str) {
+                let domains: Vec<String> = domains
+                    .iter()
+                    .map(|d| d.trim().trim_start_matches('.').to_string())
+                    .filter(|d| !d.is_empty())
+                    .collect();
+                if domains.is_empty() || servers.is_empty() {
+                    return;
+                }
+                let servers_ps = servers
+                    .iter()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| format!("'{}'", s.trim()))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let _ = tokio::fs::create_dir_all(WIN_STATE_DIR).await;
+
+                // Back up the current suffix search list for restore.
+                if let Some(cur) =
+                    powershell("(Get-DnsClientGlobalSetting).SuffixSearchList -join ','").await
+                {
+                    let _ = tokio::fs::write(WIN_SUFFIX_BACKUP, &cur).await;
+                }
+
+                // NRPT rules: corp domains → corp resolver. `.<domain>` matches the
+                // domain and its subdomains. Record namespaces for teardown.
+                let mut namespaces: Vec<String> = Vec::new();
+                for d in &domains {
+                    let ns = format!(".{d}");
+                    let _ = powershell(&format!(
+                        "Add-DnsClientNrptRule -Namespace '{ns}' -NameServers @({servers_ps})"
+                    ))
+                    .await;
+                    namespaces.push(ns);
+                }
+                // Gateway host → PUBLIC resolver (more specific), else the corp
+                // resolver would capture it and deadlock the next connect.
+                let gw = gateway.trim();
+                if !gw.is_empty() && gw.parse::<std::net::IpAddr>().is_err() {
+                    let _ = powershell(&format!(
+                        "Add-DnsClientNrptRule -Namespace '{gw}' -NameServers @('1.1.1.1','8.8.8.8')"
+                    ))
+                    .await;
+                    namespaces.push(gw.to_string());
+                }
+                let _ = tokio::fs::write(WIN_NRPT_NS, namespaces.join("\n")).await;
+
+                // Suffix search list: prepend corp domains (bare hostnames resolve).
+                let original = tokio::fs::read_to_string(WIN_SUFFIX_BACKUP)
+                    .await
+                    .unwrap_or_default();
+                let mut list = domains.clone();
+                for s in original
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                {
+                    if !list.iter().any(|x| x == s) {
+                        list.push(s.to_string());
+                    }
+                }
+                let list_ps = list
+                    .iter()
+                    .map(|s| format!("'{s}'"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let _ = powershell(&format!(
+                    "Set-DnsClientGlobalSetting -SuffixSearchList @({list_ps})"
+                ))
+                .await;
+                tracing::info!(
+                    "corp-vpn: NRPT + suffix search configured ({} domains)",
+                    domains.len()
+                );
+            }
+
+            pub async fn teardown_dns() {
+                // Remove the NRPT rules we recorded.
+                if let Ok(body) = tokio::fs::read_to_string(WIN_NRPT_NS).await {
+                    for ns in body.lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+                        let ns = ns.replace('\'', "''");
+                        let _ = powershell(&format!(
+                            "Get-DnsClientNrptRule | Where-Object {{ $_.Namespace -eq '{ns}' }} | Remove-DnsClientNrptRule -Force"
+                        ))
+                        .await;
+                    }
+                    let _ = tokio::fs::remove_file(WIN_NRPT_NS).await;
+                }
+                // Restore the suffix search list.
+                if let Ok(cur) = tokio::fs::read_to_string(WIN_SUFFIX_BACKUP).await {
+                    let list = cur
+                        .split(',')
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| format!("'{s}'"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let cmd = if list.is_empty() {
+                        "Set-DnsClientGlobalSetting -SuffixSearchList @()".to_string()
+                    } else {
+                        format!("Set-DnsClientGlobalSetting -SuffixSearchList @({list})")
+                    };
+                    let _ = powershell(&cmd).await;
+                    let _ = tokio::fs::remove_file(WIN_SUFFIX_BACKUP).await;
+                }
+            }
+
+            pub async fn sweep() {
+                teardown_dns().await;
+            }
 
             pub async fn graceful_kill(child: &mut tokio::process::Child) {
                 // No POSIX signals on Windows; terminate the process. wintun dies

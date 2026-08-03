@@ -1,0 +1,162 @@
+# Publishes the on-demand OpenConnect component bundles (macOS / Windows / Linux)
+# as release assets in THIS repo, so the app's main repo release list stays clean
+# (only app releases there). The desktop downloads a bundle at runtime ONLY when a
+# user opts into the corporate-VPN feature — it never ships in the base installer.
+#
+# Each bundle is relocatable (its dynamic deps travel with the binary) so it runs
+# on a machine without the toolchain installed. The download URL is stable
+# (pinned tag) and the SHA-256 the job prints goes into openconnect_spec.go for
+# fail-closed verification.
+name: Publish — OpenConnect component
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish the component under"
+        required: true
+        default: components-openconnect-9.21
+
+permissions:
+  contents: write
+
+env:
+  COMPONENT_TAG: ${{ inputs.tag || 'components-openconnect-9.21' }}
+
+jobs:
+  # --------------------------------------------------------------------- macOS
+  macos:
+    runs-on: macos-14 # Apple silicon
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install openconnect + dylibbundler
+        run: brew install openconnect dylibbundler
+      - name: Assemble relocatable bundle
+        run: |
+          set -euo pipefail
+          mkdir -p bundle/libs
+          if [ -x "$(brew --prefix openconnect)/sbin/openconnect" ]; then
+            cp "$(brew --prefix openconnect)/sbin/openconnect" bundle/openconnect
+          else
+            cp "$(brew --prefix openconnect)/bin/openconnect" bundle/openconnect
+          fi
+          chmod +x bundle/openconnect
+          curl -fsSL "https://gitlab.com/openconnect/vpnc-scripts/-/raw/master/vpnc-script" -o bundle/vpnc-script
+          chmod +x bundle/vpnc-script
+          dylibbundler -od -b -x ./bundle/openconnect -d ./bundle/libs -p @executable_path/libs
+          otool -L bundle/openconnect
+          if otool -L bundle/openconnect | grep -q "/opt/homebrew\|/usr/local/Cellar\|/usr/local/opt"; then
+            echo "FAIL: still references Homebrew — not relocatable"; exit 1
+          fi
+      - name: Package + hash + publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          asset="openconnect-macos-arm64.tar.gz"
+          tar -czf "$asset" -C bundle .
+          sha=$(shasum -a 256 "$asset" | awk '{print $1}')
+          echo "$sha  $asset" > "$asset.sha256"
+          {
+            echo "### macOS arm64"
+            echo "- \`$asset\` sha256 \`$sha\` ($(ls -lh "$asset" | awk '{print $5}'))"
+            echo "  BinRel: \`openconnect\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          gh release view "$COMPONENT_TAG" >/dev/null 2>&1 || gh release create "$COMPONENT_TAG" \
+            --title "Components — OpenConnect ($COMPONENT_TAG)" \
+            --notes "On-demand OpenConnect bundles for the corporate-VPN feature. Not an app release." --prerelease
+          gh release upload "$COMPONENT_TAG" "$asset" "$asset.sha256" --clobber
+
+  # ------------------------------------------------------------------- Windows
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-openconnect
+            mingw-w64-x86_64-ntldd
+            unzip
+            curl
+            tar
+      - name: Assemble relocatable bundle (exe + DLLs + wintun)
+        run: |
+          set -euo pipefail
+          mkdir -p bundle
+          cp /mingw64/bin/openconnect.exe bundle/openconnect.exe
+          # Collect the mingw DLL deps that travel with the binary.
+          ldd bundle/openconnect.exe | grep -i '=> /mingw64' | awk '{print $3}' | sort -u \
+            | while read -r dll; do cp "$dll" bundle/; done
+          # wintun.dll — OpenConnect uses it for the tunnel adapter on Windows.
+          curl -fsSLO https://www.wintun.net/builds/wintun-0.14.1.zip
+          unzip -j wintun-0.14.1.zip 'wintun/bin/amd64/wintun.dll' -d bundle/
+          ls -1 bundle/
+      - name: Package + hash + publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          asset="openconnect-windows-amd64.tar.gz"
+          tar -czf "$asset" -C bundle .
+          sha=$(sha256sum "$asset" | awk '{print $1}')
+          echo "$sha  $asset" > "$asset.sha256"
+          {
+            echo "### Windows amd64"
+            echo "- \`$asset\` sha256 \`$sha\` ($(ls -lh "$asset" | awk '{print $5}'))"
+            echo "  BinRel: \`openconnect.exe\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          gh release view "$COMPONENT_TAG" >/dev/null 2>&1 || gh release create "$COMPONENT_TAG" \
+            --title "Components — OpenConnect ($COMPONENT_TAG)" \
+            --notes "On-demand OpenConnect bundles for the corporate-VPN feature. Not an app release." --prerelease
+          gh release upload "$COMPONENT_TAG" "$asset" "$asset.sha256" --clobber
+
+  # --------------------------------------------------------------------- Linux
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install openconnect + patchelf
+        run: sudo apt-get update && sudo apt-get install -y openconnect patchelf
+      - name: Assemble relocatable bundle
+        run: |
+          set -euo pipefail
+          mkdir -p bundle/libs
+          oc="$(command -v openconnect)"
+          cp "$oc" bundle/openconnect
+          chmod +x bundle/openconnect
+          # Bundle non-core shared libs (skip the glibc/loader core, which the
+          # target already provides), then point the binary at $ORIGIN/libs.
+          ldd bundle/openconnect | awk '{print $3}' | grep -E '^/' | while read -r so; do
+            base="$(basename "$so")"
+            case "$base" in
+              libc.so*|libm.so*|libpthread.so*|libdl.so*|librt.so*|ld-linux*|libresolv.so*) continue ;;
+            esac
+            cp -Ln "$so" bundle/libs/ || true
+          done
+          patchelf --set-rpath '$ORIGIN/libs' bundle/openconnect
+          echo "--- ldd after patchelf ---"; ldd bundle/openconnect || true
+      - name: Package + hash + publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          asset="openconnect-linux-amd64.tar.gz"
+          tar -czf "$asset" -C bundle .
+          sha=$(sha256sum "$asset" | awk '{print $1}')
+          echo "$sha  $asset" > "$asset.sha256"
+          {
+            echo "### Linux amd64"
+            echo "- \`$asset\` sha256 \`$sha\` ($(ls -lh "$asset" | awk '{print $5}'))"
+            echo "  BinRel: \`openconnect\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          gh release view "$COMPONENT_TAG" >/dev/null 2>&1 || gh release create "$COMPONENT_TAG" \
+            --title "Components — OpenConnect ($COMPONENT_TAG)" \
+            --notes "On-demand OpenConnect bundles for the corporate-VPN feature. Not an app release." --prerelease
+          gh release upload "$COMPONENT_TAG" "$asset" "$asset.sha256" --clobber
