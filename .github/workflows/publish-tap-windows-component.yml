@@ -1,0 +1,74 @@
+# Publishes the on-demand TAP-Windows driver component for the corporate-VPN
+# feature, as a release asset in THIS repo (same tag as the OpenConnect bundles).
+#
+# WHY a separate driver: on Windows openconnect defaults to wintun, but two wintun
+# users (the mihomo core + openconnect) fight over the single wintun.sys driver
+# ("Failed to register rings: already initialized"). So on Windows openconnect
+# runs on OpenVPN's TAP-Windows driver instead — a separate kernel driver, so the
+# two tunnels never collide. macOS/Linux use native utun/tun and need none of this.
+#
+# WHY repackage vs build: a kernel driver must be WHQL/EV-signed to install
+# silently, which we cannot do ourselves. So we repackage OpenVPN's OFFICIALLY
+# signed tap-windows6 (tap0901.cat is signed by "Microsoft Windows Hardware
+# Compatibility Publisher") verbatim — it installs with no prompt under the SYSTEM
+# service. The desktop fetches this on demand and, before the first corp connect,
+# asks the service to `tapinstall install OemVista.inf TAP0901`.
+#
+# Kept in its own workflow (not the OpenConnect one) so publishing the driver does
+# NOT rebuild/re-hash the OpenConnect bundles (whose SHAs are pinned in the app).
+name: Publish — TAP-Windows component
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish the component under"
+        required: true
+        default: components-openconnect-9.21
+
+permissions:
+  contents: write
+
+env:
+  COMPONENT_TAG: ${{ inputs.tag || 'components-openconnect-9.21' }}
+
+jobs:
+  tap-windows:
+    runs-on: ubuntu-latest
+    env:
+      TAP_INSTALLER: tap-windows-9.24.7-I601-Win10.exe
+      TAP_INSTALLER_SHA256: 1c44e77ab148ddfb174de8041100efc38c4f23500183faff88f9badac5782e3c
+    steps:
+      - name: Fetch + verify + extract OpenVPN signed tap-windows6
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install -y p7zip-full
+          curl -fsSLO "https://build.openvpn.net/downloads/releases/${TAP_INSTALLER}"
+          echo "${TAP_INSTALLER_SHA256}  ${TAP_INSTALLER}" | sha256sum -c -
+          7z x -oextracted "${TAP_INSTALLER}" >/dev/null
+          mkdir -p bundle
+          # Flat layout (verified): driver/{OemVista.inf,tap0901.sys,tap0901.cat}
+          # + bin/tapinstall.exe. All WHQL/OpenVPN-signed; ship them verbatim.
+          cp extracted/driver/OemVista.inf bundle/
+          cp extracted/driver/tap0901.sys  bundle/
+          cp extracted/driver/tap0901.cat  bundle/
+          cp extracted/bin/tapinstall.exe  bundle/
+          echo "--- bundle contents ---"; ls -1 bundle/
+      - name: Package + hash + publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          asset="tap-windows-amd64.tar.gz"
+          tar -czf "$asset" -C bundle .
+          sha=$(sha256sum "$asset" | awk '{print $1}')
+          echo "$sha  $asset" > "$asset.sha256"
+          {
+            echo "### TAP-Windows amd64 (OpenVPN WHQL-signed tap-windows6, repackaged)"
+            echo "- \`$asset\` sha256 \`$sha\` ($(ls -lh "$asset" | awk '{print $5}'))"
+            echo "  Source: \`$TAP_INSTALLER\` — DriverVer 9.24.7.601, HWID TAP0901"
+          } >> "$GITHUB_STEP_SUMMARY"
+          gh release view "$COMPONENT_TAG" >/dev/null 2>&1 || gh release create "$COMPONENT_TAG" \
+            --title "Components — OpenConnect ($COMPONENT_TAG)" \
+            --notes "On-demand components for the corporate-VPN feature. Not an app release." --prerelease
+          gh release upload "$COMPONENT_TAG" "$asset" "$asset.sha256" --clobber
