@@ -67,6 +67,48 @@ jobs:
             --notes "On-demand OpenConnect bundles for the corporate-VPN feature. Not an app release." --prerelease
           gh release upload "$COMPONENT_TAG" "$asset" "$asset.sha256" --clobber
 
+  # ---------------------------------------------------------------- macOS Intel
+  macos-intel:
+    runs-on: macos-13 # Intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install openconnect + dylibbundler
+        run: brew install openconnect dylibbundler
+      - name: Assemble relocatable bundle
+        run: |
+          set -euo pipefail
+          mkdir -p bundle/libs
+          if [ -x "$(brew --prefix openconnect)/sbin/openconnect" ]; then
+            cp "$(brew --prefix openconnect)/sbin/openconnect" bundle/openconnect
+          else
+            cp "$(brew --prefix openconnect)/bin/openconnect" bundle/openconnect
+          fi
+          chmod +x bundle/openconnect
+          curl -fsSL "https://gitlab.com/openconnect/vpnc-scripts/-/raw/master/vpnc-script" -o bundle/vpnc-script
+          chmod +x bundle/vpnc-script
+          dylibbundler -od -b -x ./bundle/openconnect -d ./bundle/libs -p @executable_path/libs
+          if otool -L bundle/openconnect | grep -q "/opt/homebrew\|/usr/local/Cellar\|/usr/local/opt"; then
+            echo "FAIL: still references Homebrew — not relocatable"; exit 1
+          fi
+      - name: Package + hash + publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          asset="openconnect-macos-amd64.tar.gz"
+          tar -czf "$asset" -C bundle .
+          sha=$(shasum -a 256 "$asset" | awk '{print $1}')
+          echo "$sha  $asset" > "$asset.sha256"
+          {
+            echo "### macOS amd64 (Intel)"
+            echo "- \`$asset\` sha256 \`$sha\` ($(ls -lh "$asset" | awk '{print $5}'))"
+            echo "  BinRel: \`openconnect\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          gh release view "$COMPONENT_TAG" >/dev/null 2>&1 || gh release create "$COMPONENT_TAG" \
+            --title "Components — OpenConnect ($COMPONENT_TAG)" \
+            --notes "On-demand OpenConnect bundles for the corporate-VPN feature. Not an app release." --prerelease
+          gh release upload "$COMPONENT_TAG" "$asset" "$asset.sha256" --clobber
+
   # ------------------------------------------------------------------- Windows
   # MSYS2 has no prebuilt openconnect, so build it from source (mingw) against the
   # MSYS2-provided crypto/xml deps, then bundle the exe + its DLLs + wintun.dll.
