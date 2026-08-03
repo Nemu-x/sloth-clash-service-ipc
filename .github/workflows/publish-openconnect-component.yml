@@ -191,9 +191,11 @@ jobs:
             echo "closure pass $pass -> $(ls -1 bundle | wc -l) files"
             [ "$new" -eq 0 ] && break
           done
-          # wintun.dll — OpenConnect uses it for the tunnel adapter on Windows.
-          curl -fsSLO https://www.wintun.net/builds/wintun-0.14.1.zip || { echo "FAIL: wintun download"; exit 1; }
-          unzip -j wintun-0.14.1.zip 'wintun/bin/amd64/wintun.dll' -d bundle/
+          # NOTE: we deliberately DO NOT bundle wintun.dll. mihomo's core already
+          # owns a wintun adapter, and two wintun users collide on Windows ("Failed
+          # to register rings: already initialized"). With no wintun.dll present
+          # OpenConnect falls back to OpenVPN's TAP-Windows driver (installed on
+          # demand by the service) — a separate driver, so the tunnels never clash.
           echo "--- bundle contents ---"; ls -1 bundle/
           # Never ship a broken bundle: fail loudly if anything is still unresolved.
           if ldd bundle/openconnect.exe | grep -i 'not found'; then
@@ -294,8 +296,8 @@ jobs:
             echo "closure pass $pass -> $(ls -1 bundle | wc -l) files"
             [ "$new" -eq 0 ] && break
           done
-          curl -fsSLO https://www.wintun.net/builds/wintun-0.14.1.zip || { echo "FAIL: wintun download"; exit 1; }
-          unzip -j wintun-0.14.1.zip 'wintun/bin/arm64/wintun.dll' -d bundle/
+          # No wintun.dll on purpose — OpenConnect uses OpenVPN's TAP-Windows
+          # driver instead (see the amd64 job note); two wintun users would clash.
           echo "--- bundle contents ---"; ls -1 bundle/
           if ldd bundle/openconnect.exe | grep -i 'not found'; then
             echo "FAIL: unresolved DLL in bundle"; exit 1

@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 
-use crate::core::structure::{CorpVpnStartRequest, CorpVpnStatusData};
+use crate::core::structure::{CorpEnsureDriverRequest, CorpVpnStartRequest, CorpVpnStatusData};
 
 /// Split config learned from the vpnc-script environment.
 // Used by the process impl and by unit tests; unused on the `client`-only build,
@@ -346,6 +346,13 @@ mod imp {
         Ok(())
     }
 
+    /// Install the corp tunnel driver if the platform needs one (Windows: the
+    /// signed TAP-Windows driver, so OpenConnect avoids wintun). Idempotent, and a
+    /// no-op where the OS has native tun (macOS/Linux).
+    pub async fn ensure_driver(req: CorpEnsureDriverRequest) -> anyhow::Result<()> {
+        platform::ensure_driver(&req.driver_dir).await
+    }
+
     pub async fn status() -> CorpVpnStatusData {
         let mut st = STATE.lock().await;
         // If the child died, reflect disconnected — but keep the log tail so the
@@ -382,6 +389,18 @@ mod imp {
         pub use unixlike::*;
         #[cfg(target_os = "windows")]
         pub use windows::*;
+
+        // Corp tunnel driver install. Only Windows needs one — OpenConnect there
+        // runs on OpenVPN's TAP-Windows driver (mihomo owns wintun, and two wintun
+        // users collide). macOS/Linux have native tun, so nothing to install.
+        #[cfg(not(target_os = "windows"))]
+        pub async fn ensure_driver(_driver_dir: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        #[cfg(target_os = "windows")]
+        pub async fn ensure_driver(driver_dir: &str) -> anyhow::Result<()> {
+            windows::ensure_driver_impl(driver_dir).await
+        }
 
         // ----------------------------- macOS -------------------------------
         #[cfg(target_os = "macos")]
@@ -826,6 +845,70 @@ WScript.Quit(0);
                 Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
             }
 
+            /// Install OpenVPN's signed TAP-Windows driver + one TAP0901 adapter so
+            /// OpenConnect uses TAP (not wintun) and never collides with mihomo's
+            /// wintun. Idempotent. `driver_dir` is the SHA-verified component dir
+            /// the app unpacked (tapinstall.exe + OemVista.inf + tap0901.sys/.cat).
+            pub async fn ensure_driver_impl(driver_dir: &str) -> anyhow::Result<()> {
+                let dir = Path::new(driver_dir);
+                let tapinstall = dir.join("tapinstall.exe");
+                if !tapinstall.exists() || !dir.join("OemVista.inf").exists() {
+                    anyhow::bail!("tap-windows driver files missing in {driver_dir}");
+                }
+                // Idempotent: skip if a TAP0901 device is already installed.
+                if tap0901_present(&tapinstall).await {
+                    tracing::info!("corp-vpn: TAP-Windows adapter already present");
+                    return Ok(());
+                }
+                // LPE guard: the component lives in a user-writable dir but we run
+                // tapinstall.exe as SYSTEM. Refuse unless it carries a valid
+                // Authenticode signature from OpenVPN. (The .cat/.sys are WHQL, so
+                // Windows rejects a tampered driver anyway; this covers the tool.)
+                verify_openvpn_signed(&tapinstall).await?;
+                let out = tokio::process::Command::new(&tapinstall)
+                    .current_dir(dir)
+                    .args(["install", "OemVista.inf", "TAP0901"])
+                    .output()
+                    .await?;
+                if !out.status.success() {
+                    anyhow::bail!(
+                        "tapinstall install failed ({}): {}",
+                        out.status,
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    );
+                }
+                tracing::info!("corp-vpn: TAP-Windows driver installed");
+                Ok(())
+            }
+
+            async fn tap0901_present(tapinstall: &Path) -> bool {
+                // `tapinstall hwids TAP0901` lists matching devices; TAP0901 in the
+                // output means an adapter already exists.
+                match tokio::process::Command::new(tapinstall)
+                    .args(["hwids", "TAP0901"])
+                    .output()
+                    .await
+                {
+                    Ok(o) => String::from_utf8_lossy(&o.stdout).contains("TAP0901"),
+                    Err(_) => false,
+                }
+            }
+
+            async fn verify_openvpn_signed(path: &Path) -> anyhow::Result<()> {
+                let p = path.display().to_string().replace('\'', "''");
+                let script = format!(
+                    "$s = Get-AuthenticodeSignature -LiteralPath '{p}'; \
+                     if ($s.Status -ne 'Valid') {{ 'BADSTATUS:' + $s.Status }} \
+                     elseif ($s.SignerCertificate.Subject -notmatch 'OpenVPN') {{ 'WRONGSIGNER' }} \
+                     else {{ 'OK' }}"
+                );
+                let res = powershell(&script).await.unwrap_or_default();
+                if res.trim() != "OK" {
+                    anyhow::bail!("tapinstall.exe signature check failed: {res}");
+                }
+                Ok(())
+            }
+
             pub async fn setup_dns(domains: &[String], servers: &[String], gateway: &str) {
                 let domains: Vec<String> = domains
                     .iter()
@@ -948,7 +1031,7 @@ WScript.Quit(0);
 }
 
 #[cfg(feature = "standalone")]
-pub use imp::{start, status, stop, sweep_orphans};
+pub use imp::{ensure_driver, start, status, stop, sweep_orphans};
 
 #[cfg(test)]
 mod tests {

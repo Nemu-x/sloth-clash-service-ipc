@@ -35,6 +35,14 @@ pub enum IpcCommand {
     StopCorpVpn,
     #[strum(serialize = "/corp/status")]
     CorpVpnStatus,
+    // Windows-only: install OpenVPN's signed TAP-Windows driver (+ one TAP0901
+    // adapter) so OpenConnect runs on TAP instead of wintun — mihomo owns wintun,
+    // and two wintun users collide ("Failed to register rings: already
+    // initialized"). Idempotent: a no-op once the adapter exists. Only the SYSTEM
+    // service can install a driver; the desktop just points it at the SHA-verified
+    // component it unpacked. No-op on non-Windows (native tun needs no driver).
+    #[strum(serialize = "/corp/ensure-driver")]
+    EnsureCorpDriver,
     #[strum(serialize = "/writer")]
     UpdateWriter,
     #[strum(serialize = "/magic")]
