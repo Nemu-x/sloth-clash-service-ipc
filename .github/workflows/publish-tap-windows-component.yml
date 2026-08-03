@@ -42,12 +42,15 @@ jobs:
       - name: Fetch + verify + extract OpenVPN signed tap-windows6
         run: |
           set -euo pipefail
-          # Use the modern official 7-Zip (7zz), not legacy p7zip 16.02 — the old
-          # one chokes on this NSIS installer ("Break signaled", exit 255).
+          # Use the modern 7-Zip (`7zip` pkg = 7-Zip 23.01), NOT legacy p7zip 16.02
+          # which chokes on this NSIS installer ("Break signaled", exit 255). On
+          # Ubuntu 24.04 the `7zip` package exposes the binary as `7z` (not `7zz`).
           sudo apt-get update && sudo apt-get install -y 7zip
+          SZ="$(dpkg -L 7zip | grep -E '/bin/7z$' | head -1)"; SZ="${SZ:-7z}"
+          "$SZ" i | head -2 || true
           curl -fsSLO "https://build.openvpn.net/downloads/releases/${TAP_INSTALLER}"
           echo "${TAP_INSTALLER_SHA256}  ${TAP_INSTALLER}" | sha256sum -c -
-          7zz x -oextracted "${TAP_INSTALLER}" >/dev/null
+          "$SZ" x -oextracted "${TAP_INSTALLER}" >/dev/null
           mkdir -p bundle
           # Flat layout (verified): driver/{OemVista.inf,tap0901.sys,tap0901.cat}
           # + bin/tapinstall.exe. All WHQL/OpenVPN-signed; ship them verbatim.
