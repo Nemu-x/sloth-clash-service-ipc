@@ -102,8 +102,11 @@ jobs:
       - name: Build OpenConnect from source
         run: |
           set -euo pipefail
-          git clone --depth 1 --branch v9.12 https://gitlab.com/openconnect/openconnect.git src
-          cd src
+          # NOTE: the repo checkout already occupies ./src (Rust sources), so
+          # clone OpenConnect into a separate dir.
+          rm -rf ocsrc
+          git clone --depth 1 --branch v9.12 https://gitlab.com/openconnect/openconnect.git ocsrc
+          cd ocsrc
           ./autogen.sh
           ./configure --disable-nls --with-gnutls --without-openssl \
             --with-vpnc-script=vpnc-script-win.js
@@ -114,7 +117,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p bundle
-          exe="$(find src -name 'openconnect.exe' | head -n1)"
+          exe="$(find ocsrc -name 'openconnect.exe' | head -n1)"
           cp "$exe" bundle/openconnect.exe
           # Collect the mingw DLL deps that travel with the binary.
           ldd bundle/openconnect.exe | grep -i '=> /mingw64' | awk '{print $3}' | sort -u \
