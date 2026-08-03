@@ -34,7 +34,13 @@ env:
 
 jobs:
   tap-windows:
-    runs-on: ubuntu-latest
+    # Runs on Windows: 7-Zip on Linux (both p7zip and modern 7z 23.01) dies with
+    # "Break signaled" extracting this NSIS installer, but the pre-installed
+    # Windows 7-Zip handles it cleanly (verified locally on the exact file).
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
     env:
       TAP_INSTALLER: tap-windows-9.24.7-I601-Win10.exe
       TAP_INSTALLER_SHA256: 1c44e77ab148ddfb174de8041100efc38c4f23500183faff88f9badac5782e3c
@@ -42,12 +48,7 @@ jobs:
       - name: Fetch + verify + extract OpenVPN signed tap-windows6
         run: |
           set -euo pipefail
-          # Use the modern 7-Zip (`7zip` pkg = 7-Zip 23.01), NOT legacy p7zip 16.02
-          # which chokes on this NSIS installer ("Break signaled", exit 255). On
-          # Ubuntu 24.04 the `7zip` package exposes the binary as `7z` (not `7zz`).
-          sudo apt-get update && sudo apt-get install -y 7zip
-          SZ="$(dpkg -L 7zip | grep -E '/bin/7z$' | head -1)"; SZ="${SZ:-7z}"
-          "$SZ" i | head -2 || true
+          SZ="/c/Program Files/7-Zip/7z.exe"
           curl -fsSLO "https://build.openvpn.net/downloads/releases/${TAP_INSTALLER}"
           echo "${TAP_INSTALLER_SHA256}  ${TAP_INSTALLER}" | sha256sum -c -
           "$SZ" x -oextracted "${TAP_INSTALLER}" >/dev/null
