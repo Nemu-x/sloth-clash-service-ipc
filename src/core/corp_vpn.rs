@@ -1,26 +1,31 @@
-//! Corporate-VPN sidecar (corp-vpn-coexistence, P1, macOS-first).
+//! Corporate-VPN sidecar (corp-vpn-coexistence). Cross-platform.
 //!
 //! The privileged service spawns and supervises a bundled OpenConnect (Cisco
 //! AnyConnect protocol) and captures the routes/DNS the gateway pushes, so the
 //! app can split traffic: corp subnets go through OpenConnect, everything else
 //! through mihomo (which excludes those subnets). Only the SYSTEM/root service
-//! can bring up the corp tun and configure its routes.
+//! can bring up the corp tunnel and configure its routes.
 //!
-//! Teardown-safe model: our vpnc-script brings up the tunnel interface ONLY and
-//! dumps the pushed config (CISCO_SPLIT_INC_* etc.) to a file — it never touches
-//! routes or system DNS. The service then installs corp routes onto the utun
-//! itself (the kernel scrubs them when the interface dies, so nothing leaks on
-//! SIGKILL), and mihomo owns DNS. [`parse_vpnc_env`] is the dump parser — pure
-//! and unit-tested against a real gateway's shape. See openspec design
-//! "Routing & DNS ownership" for why this is crash-safe by construction.
+//! Architecture: the ORCHESTRATION (spawn OpenConnect, learn the split from a
+//! wrapper vpnc-script's env dump, install routes, wire DNS, teardown) is
+//! shared. Everything OS-specific — the script body, route/DNS/search-domain
+//! application, graceful kill — lives behind the `platform` seam, implemented
+//! per OS (macOS / Windows / Linux). Adding a platform = implement that seam,
+//! not re-implement the lifecycle.
+//!
+//! Teardown-safe model: the vpnc-script only brings up the tunnel interface and
+//! dumps config — it never installs routes or DNS. We own those, so a crash/kill
+//! can't leave stale system state (interface-scoped routes die with the tunnel;
+//! DNS is removed deterministically + swept on startup). [`parse_vpnc_env`] is
+//! the dump parser — pure and unit-tested against a real gateway's shape.
 
 use std::collections::HashMap;
 
 use crate::core::structure::{CorpVpnStartRequest, CorpVpnStatusData};
 
 /// Split config learned from the vpnc-script environment.
-// Used by the macOS process impl and by unit tests; unused on the non-macOS
-// build (the port lands in P2/P3), so allow dead_code there.
+// Used by the process impl and by unit tests; unused on the `client`-only build,
+// so allow dead_code there.
 #[allow(dead_code)]
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CorpSplit {
@@ -126,11 +131,10 @@ pub fn extract_servercert_pin(stderr: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Process management (macOS-first). Non-macOS returns a clear "unsupported"
-// until the Windows/Linux ports land (P2/P3).
+// Shared orchestration. OS-specific bits live behind `platform` (below).
 // ---------------------------------------------------------------------------
 
-#[cfg(all(feature = "standalone", target_os = "macos"))]
+#[cfg(feature = "standalone")]
 mod imp {
     use super::*;
     use std::collections::VecDeque;
@@ -152,7 +156,6 @@ mod imp {
         status: CorpVpnStatusData,
         dump_path: Option<PathBuf>,
         logs: LogBuffer,
-        resolver_files: Vec<PathBuf>,
     }
 
     static STATE: Lazy<Mutex<State>> = Lazy::new(|| {
@@ -161,218 +164,11 @@ mod imp {
             status: CorpVpnStatusData::default(),
             dump_path: None,
             logs: Arc::new(Mutex::new(VecDeque::new())),
-            resolver_files: Vec::new(),
         })
     });
 
-    /// Marker written into every /etc/resolver file we create, so a startup
-    /// sweep can find and remove ones a crash left behind.
-    const RESOLVER_MARKER: &str = "# managed-by: sloth-corp";
-
-    /// Point the system resolver at the corp DNS for corp domains, via macOS
-    /// `/etc/resolver/<domain>` files. This is REQUIRED because a machine whose
-    /// system DNS is the local router (192.168.x) never reaches mihomo for these
-    /// names, so corp hostnames would resolve nowhere. The corp resolver is
-    /// reachable through the tunnel (its subnet is routed to the utun). The
-    /// gateway host gets a MORE-specific file pointing at public DNS so it never
-    /// resolves via the corp resolver (which would deadlock the next connect).
-    /// Returns the files created, for deterministic teardown.
-    async fn configure_corp_dns(
-        domains: &[String],
-        servers: &[String],
-        gateway: &str,
-    ) -> Vec<PathBuf> {
-        let mut created = Vec::new();
-        if servers.is_empty() {
-            return created;
-        }
-        let _ = tokio::fs::create_dir_all("/etc/resolver").await;
-        let ns: String = servers
-            .iter()
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| format!("nameserver {}\n", s.trim()))
-            .collect();
-        for d in domains {
-            let d = d.trim();
-            if d.is_empty() {
-                continue;
-            }
-            let path = PathBuf::from(format!("/etc/resolver/{d}"));
-            if tokio::fs::write(&path, format!("{RESOLVER_MARKER}\n{ns}"))
-                .await
-                .is_ok()
-            {
-                created.push(path);
-            }
-        }
-        let gw = gateway.trim();
-        if !gw.is_empty() && gw.parse::<std::net::IpAddr>().is_err() {
-            let path = PathBuf::from(format!("/etc/resolver/{gw}"));
-            let body = format!("{RESOLVER_MARKER}\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n");
-            if tokio::fs::write(&path, body).await.is_ok() {
-                created.push(path);
-            }
-        }
-        created
-    }
-
-    async fn clear_corp_dns(files: &[PathBuf]) {
-        for f in files {
-            let _ = tokio::fs::remove_file(f).await;
-        }
-    }
-
-    /// Remove any resolver files we left behind (identified by RESOLVER_MARKER) —
-    /// e.g. after a hard kill. Corp-domain-scoped, so it never touches unrelated
-    /// resolver entries.
-    async fn sweep_corp_dns() {
-        let mut dir = match tokio::fs::read_dir("/etc/resolver").await {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-        while let Ok(Some(entry)) = dir.next_entry().await {
-            let p = entry.path();
-            if let Ok(body) = tokio::fs::read_to_string(&p).await
-                && body.contains(RESOLVER_MARKER)
-            {
-                let _ = tokio::fs::remove_file(&p).await;
-            }
-        }
-    }
-
-    // --- Search domains -----------------------------------------------------
-    // The /etc/resolver files only route queries FOR a corp domain; a BARE host
-    // like "srv-01" needs the corp domain in the system SEARCH list so it becomes
-    // "srv-01.corp.example" and then matches the resolver. We set the corp search
-    // domains on the primary network service (via networksetup) and back up the
-    // originals to a file so a crash can be recovered deterministically.
-
-    const SEARCH_BACKUP: &str = "/var/db/sloth-corp/searchdomains.bak";
-
-    /// The network service carrying the default route (e.g. "Wi-Fi"), which owns
-    /// the resolver search list. Maps the default-route interface to its service
-    /// name via `networksetup -listnetworkserviceorder`.
-    async fn primary_network_service() -> Option<String> {
-        let iface = {
-            let out = tokio::process::Command::new("/sbin/route")
-                .args(["-n", "get", "default"])
-                .output()
-                .await
-                .ok()?;
-            String::from_utf8_lossy(&out.stdout).lines().find_map(|l| {
-                l.trim()
-                    .strip_prefix("interface:")
-                    .map(|s| s.trim().to_string())
-            })?
-        };
-        let out = tokio::process::Command::new("/usr/sbin/networksetup")
-            .arg("-listnetworkserviceorder")
-            .output()
-            .await
-            .ok()?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        let needle = format!("Device: {iface})");
-        let mut service = String::new();
-        for line in text.lines() {
-            let l = line.trim();
-            if l.starts_with('(')
-                && let Some(close) = l.find(") ")
-                && l[1..close].chars().all(|c| c.is_ascii_digit())
-            {
-                service = l[close + 2..].trim().to_string();
-                continue;
-            }
-            if l.contains(&needle) && !service.is_empty() {
-                return Some(service);
-            }
-        }
-        None
-    }
-
-    async fn get_search_domains(service: &str) -> Vec<String> {
-        let out = match tokio::process::Command::new("/usr/sbin/networksetup")
-            .args(["-getsearchdomains", service])
-            .output()
-            .await
-        {
-            Ok(o) => o,
-            Err(_) => return Vec::new(),
-        };
-        let text = String::from_utf8_lossy(&out.stdout);
-        if text.contains("aren't any") {
-            return Vec::new();
-        }
-        text.lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect()
-    }
-
-    async fn set_search_domains(service: &str, domains: &[String]) {
-        let mut cmd = tokio::process::Command::new("/usr/sbin/networksetup");
-        cmd.arg("-setsearchdomains").arg(service);
-        if domains.is_empty() {
-            cmd.arg("empty");
-        } else {
-            for d in domains {
-                cmd.arg(d);
-            }
-        }
-        let _ = cmd.output().await;
-    }
-
-    /// Prepend the corp search domains to the primary service's list so bare corp
-    /// hostnames resolve. Backs up the originals first for deterministic restore.
-    async fn configure_corp_search_domains(domains: &[String]) {
-        let domains: Vec<String> = domains
-            .iter()
-            .map(|d| d.trim().to_string())
-            .filter(|d| !d.is_empty())
-            .collect();
-        if domains.is_empty() {
-            return;
-        }
-        let Some(service) = primary_network_service().await else {
-            return;
-        };
-        let original = get_search_domains(&service).await;
-        let _ = tokio::fs::create_dir_all("/var/db/sloth-corp").await;
-        let backup = format!("{service}\n{}", original.join("\n"));
-        let _ = tokio::fs::write(SEARCH_BACKUP, backup).await;
-        let mut combined = domains;
-        for d in &original {
-            if !combined.contains(d) {
-                combined.push(d.clone());
-            }
-        }
-        set_search_domains(&service, &combined).await;
-        tracing::info!("corp-vpn: set search domains on {service}");
-    }
-
-    /// Restore the pre-corp search domains from the backup (deterministic teardown;
-    /// also self-heals after a crash). No-op when no backup exists.
-    async fn restore_corp_search_domains() {
-        let body = match tokio::fs::read_to_string(SEARCH_BACKUP).await {
-            Ok(b) => b,
-            Err(_) => return,
-        };
-        let mut lines = body.lines();
-        let Some(service) = lines.next().map(|s| s.trim().to_string()) else {
-            return;
-        };
-        if !service.is_empty() {
-            let original: Vec<String> = lines
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect();
-            set_search_domains(&service, &original).await;
-        }
-        let _ = tokio::fs::remove_file(SEARCH_BACKUP).await;
-    }
-
-    /// Spawn a task that streams a child's stderr into a capped ring buffer. This
-    /// both feeds the UI log view AND keeps the OS pipe drained so OpenConnect
-    /// never blocks writing stderr once the tunnel is up (it logs periodically).
+    /// Stream a child's stderr into a capped ring buffer. Feeds the UI log view
+    /// AND keeps the OS pipe drained so OpenConnect never blocks writing stderr.
     fn spawn_stderr_reader(stderr: tokio::process::ChildStderr, logs: LogBuffer) {
         tokio::spawn(async move {
             let mut lines = tokio::io::BufReader::new(stderr).lines();
@@ -387,47 +183,24 @@ mod imp {
     }
 
     pub async fn start(req: CorpVpnStartRequest) -> anyhow::Result<CorpVpnStatusData> {
-        // One corp tunnel at a time — tear down any previous run first, and sweep
-        // any resolver files a previous crash may have left behind so a stale corp
-        // domain override never lingers.
+        // One corp tunnel at a time — tear down any previous run, and sweep any
+        // system state a previous crash may have left so nothing stale lingers.
         stop().await.ok();
-        sweep_corp_dns().await;
+        platform::sweep().await;
 
         let bin = PathBuf::from(&req.bin_path);
         if !bin.is_file() {
             anyhow::bail!("openconnect binary not found at {}", req.bin_path);
         }
-        // A per-run scratch dir for the env dump + wrapper script.
+
+        // Per-run scratch dir for the env dump + the interface-only vpnc-script.
         let run_dir = std::env::temp_dir().join(format!("sloth-corp-{}", std::process::id()));
         tokio::fs::create_dir_all(&run_dir).await?;
         let dump = run_dir.join("vpnc-env.dump");
         let _ = tokio::fs::remove_file(&dump).await;
-        let wrapper = run_dir.join("vpnc-script.sh");
-
-        // Teardown-safe model: our vpnc-script brings up the tunnel interface and
-        // NOTHING else — no `route add`, no `scutil`/DNS. That keeps all
-        // persistent system state ours: the service installs corp routes onto the
-        // utun (which the kernel scrubs when the interface dies, even on SIGKILL),
-        // and mihomo owns DNS. So a crash/kill can never leave stale routes or a
-        // stuck resolver behind. See openspec corp-vpn-coexistence design.
-        let wrapper_body = format!(
-            r#"#!/bin/sh
-case "$reason" in
-  connect|reconnect)
-    /sbin/ifconfig "$TUNDEV" inet "$INTERNAL_IP4_ADDRESS" "$INTERNAL_IP4_ADDRESS" netmask 255.255.255.255 mtu "${{INTERNAL_IP4_MTU:-1400}}" up
-    # Prefix match, NO trailing '=': the interesting keys are indexed subkeys
-    # (CISCO_SPLIT_INC_0_ADDR, INTERNAL_IP4_DNS, ...). Anchoring '=' right after
-    # the prefix would only catch the bare counter (CISCO_SPLIT_INC=N) and drop
-    # the actual routes/DNS → the parser sees no split → false "full tunnel".
-    env | grep -E '^(CISCO_SPLIT_INC|INTERNAL_IP4|CISCO_.*DOMAIN|VPNGATEWAY|TUNDEV)' > '{dump}'
-    ;;
-esac
-exit 0
-"#,
-            dump = dump.display(),
-        );
-        tokio::fs::write(&wrapper, wrapper_body).await?;
-        set_exec(&wrapper).await?;
+        let wrapper = run_dir.join(format!("vpnc-script{}", platform::VPNC_SCRIPT_EXT));
+        tokio::fs::write(&wrapper, platform::vpnc_script_body(&dump)).await?;
+        platform::make_executable(&wrapper).await;
 
         let mut cmd = tokio::process::Command::new(&bin);
         cmd.arg("--script")
@@ -436,17 +209,18 @@ exit 0
             .arg(&req.username)
             .arg("--passwd-on-stdin")
             .arg("--non-inter");
+        for a in platform::openconnect_extra_args() {
+            cmd.arg(a);
+        }
         if !req.servercert.trim().is_empty() {
             cmd.arg("--servercert").arg(req.servercert.trim());
         }
         cmd.arg(&req.gateway);
         cmd.stdin(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        // If this handler's future is ever dropped (client disconnect, server
-        // handler-timeout, supersede), kill OpenConnect with it — a leaked
-        // process keeps installing corp routes/DNS and breaks the machine's
-        // normal traffic. Once connected we move the child into STATE, so a live
-        // tunnel is unaffected; only an in-flight/abandoned connect is reaped.
+        // If this future is dropped (client disconnect, handler-timeout, supersede)
+        // kill OpenConnect with it — a leaked tunnel keeps corp routes/DNS live and
+        // breaks normal traffic. Once connected the child moves into STATE.
         cmd.kill_on_drop(true);
 
         let mut child = cmd.spawn()?;
@@ -457,8 +231,6 @@ exit 0
             let _ = stdin.shutdown().await;
         }
 
-        // Continuously drain stderr into a ring buffer for the UI log view (and
-        // so the pipe never fills and stalls OpenConnect once connected).
         let logs: LogBuffer = Arc::new(Mutex::new(VecDeque::new()));
         if let Some(stderr) = child.stderr.take() {
             spawn_stderr_reader(stderr, logs.clone());
@@ -476,19 +248,13 @@ exit 0
         let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
         loop {
             if let Ok(true) = tokio::fs::try_exists(&dump).await {
-                // Give the wrapper a beat to finish writing.
                 tokio::time::sleep(Duration::from_millis(150)).await;
                 let dumped = tokio::fs::read_to_string(&dump).await.unwrap_or_default();
                 let split = parse_vpnc_env(&dumped);
-                // We own routing: install each corp subnet onto the tunnel iface.
-                // Interface-scoped routes die with the utun (kernel scrubs them on
-                // process death), so this is self-cleaning even on SIGKILL.
-                install_corp_routes(&split.routes, &split.tundev).await;
-                // Make corp domains resolvable system-wide (see configure_corp_dns).
-                let resolver_files =
-                    configure_corp_dns(&split.dns_domains, &split.dns_servers, &req.gateway).await;
-                // Search domains so BARE corp hostnames (e.g. "srv-01") resolve.
-                configure_corp_search_domains(&split.dns_domains).await;
+                // We own routing + DNS: install corp routes onto the tunnel iface,
+                // and make corp domains (incl. bare hostnames) resolvable system-wide.
+                platform::install_routes(&split.routes, &split.tundev).await;
+                platform::setup_dns(&split.dns_domains, &split.dns_servers, &req.gateway).await;
                 let status = CorpVpnStatusData {
                     connected: true,
                     needs_cert_trust: false,
@@ -506,7 +272,6 @@ exit 0
                 st.dump_path = Some(dump.clone());
                 st.status = status.clone();
                 st.logs = logs.clone();
-                st.resolver_files = resolver_files;
                 tracing::info!(
                     "corp-vpn: connected on {}, {} route(s)",
                     status.tundev,
@@ -515,7 +280,6 @@ exit 0
                 return Ok(status);
             }
             if let Ok(Some(exit)) = child.try_wait() {
-                // Let the reader flush the final lines before we inspect them.
                 tokio::time::sleep(Duration::from_millis(120)).await;
                 let stderr = collected_logs().await;
                 let _ = exit;
@@ -546,25 +310,12 @@ exit 0
         let mut st = STATE.lock().await;
         let routes = st.status.routes.clone();
         let tundev = st.status.tundev.clone();
-        let resolver_files = std::mem::take(&mut st.resolver_files);
-        clear_corp_dns(&resolver_files).await;
-        restore_corp_search_domains().await;
+        platform::teardown_dns().await;
         if let Some(mut child) = st.child.take() {
-            // Graceful first: SIGTERM lets OpenConnect close the CSTP session with
-            // the gateway cleanly. Give it a moment, then SIGKILL as a backstop.
-            // Either way the utun dies with the process and the kernel scrubs our
-            // interface-scoped routes; the explicit delete below is belt-and-braces.
-            if let Some(pid) = child.id() {
-                unsafe {
-                    platform_lib::kill(pid as platform_lib::pid_t, platform_lib::SIGTERM);
-                }
-                let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
-            }
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            platform::graceful_kill(&mut child).await;
         }
         if !tundev.is_empty() {
-            remove_corp_routes(&routes, &tundev).await;
+            platform::teardown_routes(&routes, &tundev).await;
         }
         if let Some(p) = st.dump_path.take() {
             let _ = tokio::fs::remove_file(p).await;
@@ -572,42 +323,6 @@ exit 0
         st.status = CorpVpnStatusData::default();
         st.logs.lock().await.clear();
         Ok(())
-    }
-
-    /// install_corp_routes points each corp subnet at the tunnel interface. Route
-    /// entries scoped to an interface are removed by the kernel when that
-    /// interface goes away, so they are self-cleaning on any process death.
-    async fn install_corp_routes(routes: &[String], tundev: &str) {
-        if tundev.is_empty() {
-            return;
-        }
-        for r in routes {
-            let out = tokio::process::Command::new("/sbin/route")
-                .args(["-n", "add", "-net", r, "-interface", tundev])
-                .output()
-                .await;
-            match out {
-                Ok(o) if o.status.success() => {
-                    tracing::info!("corp-vpn: route {r} -> {tundev}");
-                }
-                Ok(o) => tracing::warn!(
-                    "corp-vpn: route add {r} failed: {}",
-                    String::from_utf8_lossy(&o.stderr).trim()
-                ),
-                Err(e) => tracing::warn!("corp-vpn: route add {r} spawn failed: {e}"),
-            }
-        }
-    }
-
-    /// remove_corp_routes deletes what install_corp_routes added. Best-effort: the
-    /// kernel usually removed them already when the utun died.
-    async fn remove_corp_routes(routes: &[String], tundev: &str) {
-        for r in routes {
-            let _ = tokio::process::Command::new("/sbin/route")
-                .args(["-n", "delete", "-net", r, "-interface", tundev])
-                .output()
-                .await;
-        }
     }
 
     pub async fn status() -> CorpVpnStatusData {
@@ -625,19 +340,9 @@ exit 0
         status
     }
 
-    /// Boot-time cleanup: drop any resolver files a previous (crashed) run left,
-    /// so a stale corp-domain override can't linger after the service restarts.
+    /// Boot-time cleanup: drop any corp routes/DNS a previous (crashed) run left.
     pub async fn sweep_orphans() {
-        restore_corp_search_domains().await;
-        sweep_corp_dns().await;
-    }
-
-    async fn set_exec(path: &std::path::Path) -> anyhow::Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = tokio::fs::metadata(path).await?.permissions();
-        perms.set_mode(0o755);
-        tokio::fs::set_permissions(path, perms).await?;
-        Ok(())
+        platform::sweep().await;
     }
 
     fn tail(s: &str) -> String {
@@ -645,22 +350,461 @@ exit 0
         let start = t.len().saturating_sub(400);
         t[start..].to_string()
     }
-}
 
-#[cfg(all(feature = "standalone", not(target_os = "macos")))]
-mod imp {
-    use super::*;
+    // =======================================================================
+    // Platform seam — one backend per OS. Each provides the same surface.
+    // =======================================================================
+    mod platform {
+        #[cfg(target_os = "macos")]
+        pub use macos::*;
+        #[cfg(all(unix, not(target_os = "macos")))]
+        pub use unixlike::*;
+        #[cfg(target_os = "windows")]
+        pub use windows::*;
 
-    pub async fn start(_req: CorpVpnStartRequest) -> anyhow::Result<CorpVpnStatusData> {
-        anyhow::bail!("corporate VPN is only supported on macOS in this build")
+        // ----------------------------- macOS -------------------------------
+        #[cfg(target_os = "macos")]
+        mod macos {
+            use std::path::Path;
+
+            pub const VPNC_SCRIPT_EXT: &str = ".sh";
+            const RESOLVER_MARKER: &str = "# managed-by: sloth-corp";
+            const SEARCH_BACKUP: &str = "/var/db/sloth-corp/searchdomains.bak";
+
+            pub fn openconnect_extra_args() -> Vec<String> {
+                Vec::new()
+            }
+
+            pub fn vpnc_script_body(dump: &Path) -> String {
+                // Interface up + env dump ONLY. No routes, no DNS (we own those).
+                // Prefix grep with NO trailing '=' so indexed subkeys
+                // (CISCO_SPLIT_INC_0_ADDR, INTERNAL_IP4_DNS) are captured.
+                format!(
+                    r#"#!/bin/sh
+case "$reason" in
+  connect|reconnect)
+    /sbin/ifconfig "$TUNDEV" inet "$INTERNAL_IP4_ADDRESS" "$INTERNAL_IP4_ADDRESS" netmask 255.255.255.255 mtu "${{INTERNAL_IP4_MTU:-1400}}" up
+    env | grep -E '^(CISCO_SPLIT_INC|INTERNAL_IP4|CISCO_.*DOMAIN|VPNGATEWAY|TUNDEV)' > '{dump}'
+    ;;
+esac
+exit 0
+"#,
+                    dump = dump.display(),
+                )
+            }
+
+            pub async fn make_executable(path: &Path) {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(md) = tokio::fs::metadata(path).await {
+                    let mut perms = md.permissions();
+                    perms.set_mode(0o755);
+                    let _ = tokio::fs::set_permissions(path, perms).await;
+                }
+            }
+
+            pub async fn install_routes(routes: &[String], tundev: &str) {
+                if tundev.is_empty() {
+                    return;
+                }
+                for r in routes {
+                    let out = tokio::process::Command::new("/sbin/route")
+                        .args(["-n", "add", "-net", r, "-interface", tundev])
+                        .output()
+                        .await;
+                    match out {
+                        Ok(o) if o.status.success() => {
+                            tracing::info!("corp-vpn: route {r} -> {tundev}")
+                        }
+                        Ok(o) => tracing::warn!(
+                            "corp-vpn: route add {r} failed: {}",
+                            String::from_utf8_lossy(&o.stderr).trim()
+                        ),
+                        Err(e) => tracing::warn!("corp-vpn: route add {r} spawn failed: {e}"),
+                    }
+                }
+            }
+
+            pub async fn teardown_routes(routes: &[String], tundev: &str) {
+                for r in routes {
+                    let _ = tokio::process::Command::new("/sbin/route")
+                        .args(["-n", "delete", "-net", r, "-interface", tundev])
+                        .output()
+                        .await;
+                }
+            }
+
+            pub async fn setup_dns(domains: &[String], servers: &[String], gateway: &str) {
+                configure_corp_resolvers(domains, servers, gateway).await;
+                configure_corp_search_domains(domains).await;
+            }
+
+            pub async fn teardown_dns() {
+                sweep_resolvers().await;
+                restore_corp_search_domains().await;
+            }
+
+            pub async fn sweep() {
+                restore_corp_search_domains().await;
+                sweep_resolvers().await;
+            }
+
+            pub async fn graceful_kill(child: &mut tokio::process::Child) {
+                // SIGTERM first so OpenConnect closes the CSTP session cleanly,
+                // then SIGKILL as a backstop.
+                if let Some(pid) = child.id() {
+                    unsafe {
+                        platform_lib::kill(pid as platform_lib::pid_t, platform_lib::SIGTERM);
+                    }
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
+                }
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
+
+            // corp domains → /etc/resolver/<domain> → corp resolver (reachable via
+            // the tunnel). Gateway host gets a more-specific PUBLIC override to
+            // avoid a resolve deadlock. Marked so the sweep can reap crash leftovers.
+            async fn configure_corp_resolvers(
+                domains: &[String],
+                servers: &[String],
+                gateway: &str,
+            ) {
+                if servers.is_empty() {
+                    return;
+                }
+                let _ = tokio::fs::create_dir_all("/etc/resolver").await;
+                let ns: String = servers
+                    .iter()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| format!("nameserver {}\n", s.trim()))
+                    .collect();
+                for d in domains {
+                    let d = d.trim();
+                    if d.is_empty() {
+                        continue;
+                    }
+                    let path = format!("/etc/resolver/{d}");
+                    let _ = tokio::fs::write(&path, format!("{RESOLVER_MARKER}\n{ns}")).await;
+                }
+                let gw = gateway.trim();
+                if !gw.is_empty() && gw.parse::<std::net::IpAddr>().is_err() {
+                    let body =
+                        format!("{RESOLVER_MARKER}\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n");
+                    let _ = tokio::fs::write(format!("/etc/resolver/{gw}"), body).await;
+                }
+            }
+
+            async fn sweep_resolvers() {
+                let mut dir = match tokio::fs::read_dir("/etc/resolver").await {
+                    Ok(d) => d,
+                    Err(_) => return,
+                };
+                while let Ok(Some(entry)) = dir.next_entry().await {
+                    let p = entry.path();
+                    if let Ok(body) = tokio::fs::read_to_string(&p).await
+                        && body.contains(RESOLVER_MARKER)
+                    {
+                        let _ = tokio::fs::remove_file(&p).await;
+                    }
+                }
+            }
+
+            async fn primary_network_service() -> Option<String> {
+                let iface = {
+                    let out = tokio::process::Command::new("/sbin/route")
+                        .args(["-n", "get", "default"])
+                        .output()
+                        .await
+                        .ok()?;
+                    String::from_utf8_lossy(&out.stdout).lines().find_map(|l| {
+                        l.trim()
+                            .strip_prefix("interface:")
+                            .map(|s| s.trim().to_string())
+                    })?
+                };
+                let out = tokio::process::Command::new("/usr/sbin/networksetup")
+                    .arg("-listnetworkserviceorder")
+                    .output()
+                    .await
+                    .ok()?;
+                let text = String::from_utf8_lossy(&out.stdout);
+                let needle = format!("Device: {iface})");
+                let mut service = String::new();
+                for line in text.lines() {
+                    let l = line.trim();
+                    if l.starts_with('(')
+                        && let Some(close) = l.find(") ")
+                        && l[1..close].chars().all(|c| c.is_ascii_digit())
+                    {
+                        service = l[close + 2..].trim().to_string();
+                        continue;
+                    }
+                    if l.contains(&needle) && !service.is_empty() {
+                        return Some(service);
+                    }
+                }
+                None
+            }
+
+            async fn get_search_domains(service: &str) -> Vec<String> {
+                let out = match tokio::process::Command::new("/usr/sbin/networksetup")
+                    .args(["-getsearchdomains", service])
+                    .output()
+                    .await
+                {
+                    Ok(o) => o,
+                    Err(_) => return Vec::new(),
+                };
+                let text = String::from_utf8_lossy(&out.stdout);
+                if text.contains("aren't any") {
+                    return Vec::new();
+                }
+                text.lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect()
+            }
+
+            async fn set_search_domains(service: &str, domains: &[String]) {
+                let mut cmd = tokio::process::Command::new("/usr/sbin/networksetup");
+                cmd.arg("-setsearchdomains").arg(service);
+                if domains.is_empty() {
+                    cmd.arg("empty");
+                } else {
+                    for d in domains {
+                        cmd.arg(d);
+                    }
+                }
+                let _ = cmd.output().await;
+            }
+
+            async fn configure_corp_search_domains(domains: &[String]) {
+                let domains: Vec<String> = domains
+                    .iter()
+                    .map(|d| d.trim().to_string())
+                    .filter(|d| !d.is_empty())
+                    .collect();
+                if domains.is_empty() {
+                    return;
+                }
+                let Some(service) = primary_network_service().await else {
+                    return;
+                };
+                let original = get_search_domains(&service).await;
+                let _ = tokio::fs::create_dir_all("/var/db/sloth-corp").await;
+                let backup = format!("{service}\n{}", original.join("\n"));
+                let _ = tokio::fs::write(SEARCH_BACKUP, backup).await;
+                let mut combined = domains;
+                for d in &original {
+                    if !combined.contains(d) {
+                        combined.push(d.clone());
+                    }
+                }
+                set_search_domains(&service, &combined).await;
+                tracing::info!("corp-vpn: set search domains on {service}");
+            }
+
+            async fn restore_corp_search_domains() {
+                let body = match tokio::fs::read_to_string(SEARCH_BACKUP).await {
+                    Ok(b) => b,
+                    Err(_) => return,
+                };
+                let mut lines = body.lines();
+                let Some(service) = lines.next().map(|s| s.trim().to_string()) else {
+                    return;
+                };
+                if !service.is_empty() {
+                    let original: Vec<String> = lines
+                        .map(|l| l.trim().to_string())
+                        .filter(|l| !l.is_empty())
+                        .collect();
+                    set_search_domains(&service, &original).await;
+                }
+                let _ = tokio::fs::remove_file(SEARCH_BACKUP).await;
+            }
+        }
+
+        // ------------------------- Linux / other unix ----------------------
+        // Interface + routes are functional (iproute2). DNS via /etc/resolver is
+        // macOS-only; Linux resolver wiring (systemd-resolved / resolv.conf) is
+        // the remaining piece — validated on a real Linux box before shipping P3.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        mod unixlike {
+            use std::path::Path;
+
+            pub const VPNC_SCRIPT_EXT: &str = ".sh";
+
+            pub fn openconnect_extra_args() -> Vec<String> {
+                Vec::new()
+            }
+
+            pub fn vpnc_script_body(dump: &Path) -> String {
+                format!(
+                    r#"#!/bin/sh
+case "$reason" in
+  connect|reconnect)
+    ip addr add "$INTERNAL_IP4_ADDRESS/32" dev "$TUNDEV" 2>/dev/null
+    ip link set dev "$TUNDEV" mtu "${{INTERNAL_IP4_MTU:-1400}}" up
+    env | grep -E '^(CISCO_SPLIT_INC|INTERNAL_IP4|CISCO_.*DOMAIN|VPNGATEWAY|TUNDEV)' > '{dump}'
+    ;;
+esac
+exit 0
+"#,
+                    dump = dump.display(),
+                )
+            }
+
+            pub async fn make_executable(path: &Path) {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(md) = tokio::fs::metadata(path).await {
+                    let mut perms = md.permissions();
+                    perms.set_mode(0o755);
+                    let _ = tokio::fs::set_permissions(path, perms).await;
+                }
+            }
+
+            pub async fn install_routes(routes: &[String], tundev: &str) {
+                if tundev.is_empty() {
+                    return;
+                }
+                for r in routes {
+                    let _ = tokio::process::Command::new("ip")
+                        .args(["route", "add", r, "dev", tundev])
+                        .output()
+                        .await;
+                }
+            }
+
+            pub async fn teardown_routes(routes: &[String], tundev: &str) {
+                for r in routes {
+                    let _ = tokio::process::Command::new("ip")
+                        .args(["route", "del", r, "dev", tundev])
+                        .output()
+                        .await;
+                }
+            }
+
+            // TODO(P3): wire corp DNS via systemd-resolved (`resolvectl domain
+            // <iface> <domain>` + `resolvectl dns <iface> <server>`) or a managed
+            // resolv.conf edit, with the same deterministic teardown + sweep.
+            pub async fn setup_dns(_domains: &[String], _servers: &[String], _gateway: &str) {
+                tracing::warn!("corp-vpn: Linux DNS wiring not implemented yet (P3)");
+            }
+            pub async fn teardown_dns() {}
+            pub async fn sweep() {}
+
+            pub async fn graceful_kill(child: &mut tokio::process::Child) {
+                if let Some(pid) = child.id() {
+                    unsafe {
+                        platform_lib::kill(pid as platform_lib::pid_t, platform_lib::SIGTERM);
+                    }
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
+                }
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
+        }
+
+        // ----------------------------- Windows -----------------------------
+        // OpenConnect on Windows uses wintun + a WSH vpnc-script. Routes via
+        // `netsh`. DNS via NRPT (Name Resolution Policy Table). The interface
+        // bring-up + NRPT wiring need validation on a real Windows box (the
+        // owner's) with the Windows OpenConnect+wintun bundle before shipping P2.
+        #[cfg(target_os = "windows")]
+        mod windows {
+            use std::path::Path;
+
+            pub const VPNC_SCRIPT_EXT: &str = ".js";
+
+            pub fn openconnect_extra_args() -> Vec<String> {
+                Vec::new()
+            }
+
+            pub fn vpnc_script_body(dump: &Path) -> String {
+                // Windows Script Host (cscript) — dump the pushed config env vars.
+                // OpenConnect+wintun brings the adapter up itself; we only learn
+                // the split here and apply routes/DNS from Rust (below).
+                let dump = dump.display().to_string().replace('\\', "\\\\");
+                format!(
+                    r#"var sh = WScript.CreateObject("WScript.Shell");
+var env = sh.Environment("PROCESS");
+var reason = "" + env("reason");
+if (reason == "connect" || reason == "reconnect") {{
+  var fso = WScript.CreateObject("Scripting.FileSystemObject");
+  var f = fso.CreateTextFile("{dump}", true);
+  var e = new Enumerator(env);
+  var re = /^(CISCO_SPLIT_INC|INTERNAL_IP4|CISCO_.*DOMAIN|VPNGATEWAY|TUNDEV)/;
+  for (; !e.atEnd(); e.moveNext()) {{
+    var line = "" + e.item();
+    if (re.test(line)) f.WriteLine(line);
+  }}
+  f.Close();
+}}
+WScript.Quit(0);
+"#,
+                    dump = dump,
+                )
+            }
+
+            pub async fn make_executable(_path: &Path) {}
+
+            pub async fn install_routes(routes: &[String], tundev: &str) {
+                if tundev.is_empty() {
+                    return;
+                }
+                for r in routes {
+                    // netsh interface ipv4 add route <prefix> "<iface>"
+                    let _ = tokio::process::Command::new("netsh")
+                        .args([
+                            "interface",
+                            "ipv4",
+                            "add",
+                            "route",
+                            r,
+                            &format!("interface={tundev}"),
+                            "store=active",
+                        ])
+                        .output()
+                        .await;
+                }
+            }
+
+            pub async fn teardown_routes(routes: &[String], tundev: &str) {
+                for r in routes {
+                    let _ = tokio::process::Command::new("netsh")
+                        .args([
+                            "interface",
+                            "ipv4",
+                            "delete",
+                            "route",
+                            r,
+                            &format!("interface={tundev}"),
+                        ])
+                        .output()
+                        .await;
+                }
+            }
+
+            // TODO(P2): NRPT rules for corp domains → corp resolver via PowerShell
+            // (Add-DnsClientNrptRule -Namespace ".corp" -NameServers <ip>), plus a
+            // deterministic removal + startup sweep. Interface bring-up may also
+            // need `netsh interface ip set address` if wintun doesn't self-assign.
+            pub async fn setup_dns(_domains: &[String], _servers: &[String], _gateway: &str) {
+                tracing::warn!("corp-vpn: Windows DNS (NRPT) wiring not implemented yet (P2)");
+            }
+            pub async fn teardown_dns() {}
+            pub async fn sweep() {}
+
+            pub async fn graceful_kill(child: &mut tokio::process::Child) {
+                // No POSIX signals on Windows; terminate the process. wintun dies
+                // with it, so the tunnel routes go away; we clean DNS explicitly.
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
+        }
     }
-    pub async fn stop() -> anyhow::Result<()> {
-        Ok(())
-    }
-    pub async fn status() -> CorpVpnStatusData {
-        CorpVpnStatusData::default()
-    }
-    pub async fn sweep_orphans() {}
 }
 
 #[cfg(feature = "standalone")]
