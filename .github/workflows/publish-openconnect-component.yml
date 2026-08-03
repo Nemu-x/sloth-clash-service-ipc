@@ -69,7 +69,7 @@ jobs:
 
   # ---------------------------------------------------------------- macOS Intel
   macos-intel:
-    runs-on: macos-13 # Intel
+    runs-on: macos-15-intel # Intel (macos-13 is queue-starved / being retired)
     steps:
       - uses: actions/checkout@v4
       - name: Install openconnect + dylibbundler
@@ -192,6 +192,85 @@ jobs:
             --notes "On-demand OpenConnect bundles for the corporate-VPN feature. Not an app release." --prerelease
           gh release upload "$COMPONENT_TAG" "$asset" "$asset.sha256" --clobber
 
+  # -------------------------------------------------------------- Windows arm64
+  # Native arm64 Windows runner + MSYS2 CLANGARM64 (there is no arm64 mingw GCC,
+  # so build with clang). Same from-source recipe as the amd64 job; deps + wintun
+  # DLL come from the arm64 trees. SPIKE: the arm64 toolchain is newer/less-tested
+  # than mingw64 — if this job goes red the amd64/mac/linux bundles still publish.
+  windows-arm64:
+    runs-on: windows-11-arm
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANGARM64
+          update: true
+          install: >-
+            base-devel
+            git
+            autoconf
+            automake
+            libtool
+            gettext-devel
+            unzip
+            curl
+            tar
+            mingw-w64-clang-aarch64-clang
+            mingw-w64-clang-aarch64-pkgconf
+            mingw-w64-clang-aarch64-gnutls
+            mingw-w64-clang-aarch64-libxml2
+            mingw-w64-clang-aarch64-zlib
+            mingw-w64-clang-aarch64-nettle
+            mingw-w64-clang-aarch64-libidn2
+      - name: Build OpenConnect from source (clang/arm64)
+        run: |
+          set -euo pipefail
+          rm -rf ocsrc
+          git clone --depth 1 --branch v9.12 https://gitlab.com/openconnect/openconnect.git ocsrc
+          cd ocsrc
+          ./autogen.sh
+          # clang is stricter than the older mingw GCC here too; demote the same
+          # Windows getsockopt/ioctl pointer-type diagnostics back to warnings.
+          CC=clang ./configure --disable-nls --with-gnutls --without-openssl \
+            --with-vpnc-script=vpnc-script-win.js \
+            CFLAGS="-O2 -g -Wno-error=incompatible-pointer-types -Wno-error=int-conversion"
+          make -j$(nproc)
+          find . -name 'openconnect.exe' -print
+      - name: Assemble relocatable bundle (exe + DLLs + wintun)
+        run: |
+          set -euo pipefail
+          mkdir -p bundle
+          exe="$(find ocsrc -name 'openconnect.exe' | head -n1)"
+          cp "$exe" bundle/openconnect.exe
+          # Collect the clang-arm64 DLL deps that travel with the binary.
+          ldd bundle/openconnect.exe | grep -iE '=> /clangarm64' | awk '{print $3}' | sort -u \
+            | while read -r dll; do cp "$dll" bundle/; done
+          curl -fsSLO https://www.wintun.net/builds/wintun-0.14.1.zip
+          unzip -j wintun-0.14.1.zip 'wintun/bin/arm64/wintun.dll' -d bundle/
+          ls -1 bundle/
+      - name: Package + hash + publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          asset="openconnect-windows-arm64.tar.gz"
+          tar -czf "$asset" -C bundle .
+          sha=$(sha256sum "$asset" | awk '{print $1}')
+          echo "$sha  $asset" > "$asset.sha256"
+          {
+            echo "### Windows arm64"
+            echo "- \`$asset\` sha256 \`$sha\` ($(ls -lh "$asset" | awk '{print $5}'))"
+            echo "  BinRel: \`openconnect.exe\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          gh release view "$COMPONENT_TAG" >/dev/null 2>&1 || gh release create "$COMPONENT_TAG" \
+            --title "Components — OpenConnect ($COMPONENT_TAG)" \
+            --notes "On-demand OpenConnect bundles for the corporate-VPN feature. Not an app release." --prerelease
+          gh release upload "$COMPONENT_TAG" "$asset" "$asset.sha256" --clobber
+
   # --------------------------------------------------------------------- Linux
   linux:
     runs-on: ubuntu-latest
@@ -228,6 +307,51 @@ jobs:
           echo "$sha  $asset" > "$asset.sha256"
           {
             echo "### Linux amd64"
+            echo "- \`$asset\` sha256 \`$sha\` ($(ls -lh "$asset" | awk '{print $5}'))"
+            echo "  BinRel: \`openconnect\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          gh release view "$COMPONENT_TAG" >/dev/null 2>&1 || gh release create "$COMPONENT_TAG" \
+            --title "Components — OpenConnect ($COMPONENT_TAG)" \
+            --notes "On-demand OpenConnect bundles for the corporate-VPN feature. Not an app release." --prerelease
+          gh release upload "$COMPONENT_TAG" "$asset" "$asset.sha256" --clobber
+
+  # --------------------------------------------------------------- Linux arm64
+  # Native arm64 runner (ubuntu-24.04-arm) so apt gives an arm64 openconnect; same
+  # relocatable-bundle recipe as amd64. Ready for the Linux desktop backend (still
+  # gated behind the unix-socket IPC wiring), so the bundle exists ahead of it.
+  linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install openconnect + patchelf
+        run: sudo apt-get update && sudo apt-get install -y openconnect patchelf
+      - name: Assemble relocatable bundle
+        run: |
+          set -euo pipefail
+          mkdir -p bundle/libs
+          oc="$(command -v openconnect)"
+          cp "$oc" bundle/openconnect
+          chmod +x bundle/openconnect
+          ldd bundle/openconnect | awk '{print $3}' | grep -E '^/' | while read -r so; do
+            base="$(basename "$so")"
+            case "$base" in
+              libc.so*|libm.so*|libpthread.so*|libdl.so*|librt.so*|ld-linux*|libresolv.so*) continue ;;
+            esac
+            cp -Ln "$so" bundle/libs/ || true
+          done
+          patchelf --set-rpath '$ORIGIN/libs' bundle/openconnect
+          echo "--- ldd after patchelf ---"; ldd bundle/openconnect || true
+      - name: Package + hash + publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          asset="openconnect-linux-arm64.tar.gz"
+          tar -czf "$asset" -C bundle .
+          sha=$(sha256sum "$asset" | awk '{print $1}')
+          echo "$sha  $asset" > "$asset.sha256"
+          {
+            echo "### Linux arm64"
             echo "- \`$asset\` sha256 \`$sha\` ($(ls -lh "$asset" | awk '{print $5}'))"
             echo "  BinRel: \`openconnect\`"
           } >> "$GITHUB_STEP_SUMMARY"
