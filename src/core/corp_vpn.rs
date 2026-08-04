@@ -244,6 +244,10 @@ mod imp {
         // breaks normal traffic. Once connected the child moves into STATE.
         cmd.kill_on_drop(true);
 
+        // Bring the corp TAP adapter back up (we put it down on the last disconnect
+        // so it wouldn't linger) before OpenConnect opens it. No-op on non-Windows.
+        platform::set_tunnel_adapter_enabled(true).await;
+
         let mut child = cmd.spawn()?;
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin
@@ -338,6 +342,9 @@ mod imp {
         if !tundev.is_empty() {
             platform::teardown_routes(&routes, &tundev).await;
         }
+        // Put the corp TAP adapter down so it doesn't linger with a stale IP/route
+        // and disturb mihomo's wintun bring-up. No-op on non-Windows.
+        platform::set_tunnel_adapter_enabled(false).await;
         if let Some(p) = st.dump_path.take() {
             let _ = tokio::fs::remove_file(p).await;
         }
@@ -400,6 +407,18 @@ mod imp {
         #[cfg(target_os = "windows")]
         pub async fn ensure_driver(driver_dir: &str) -> anyhow::Result<()> {
             windows::ensure_driver_impl(driver_dir).await
+        }
+
+        // TAP-Windows adapter lifecycle. Corp's TAP adapter is persistent, so if we
+        // leave it up between sessions it lingers with a stale IP/route and can
+        // disturb mihomo's wintun bring-up + default-interface monitor. Keep it
+        // down while corp is off, up while corp is on. No-op elsewhere (native tun
+        // has no persistent adapter to manage).
+        #[cfg(not(target_os = "windows"))]
+        pub async fn set_tunnel_adapter_enabled(_enabled: bool) {}
+        #[cfg(target_os = "windows")]
+        pub async fn set_tunnel_adapter_enabled(enabled: bool) {
+            windows::set_tap_enabled(enabled).await;
         }
 
         // ----------------------------- macOS -------------------------------
@@ -856,6 +875,19 @@ WScript.Quit(0);
                     .await
                     .ok()?;
                 Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            }
+
+            /// Enable/disable the TAP-Windows adapter by its driver description so
+            /// corp's persistent adapter is down (no stale IP/route) whenever corp
+            /// is off — otherwise it can disturb mihomo's wintun bring-up.
+            pub async fn set_tap_enabled(enabled: bool) {
+                let verb = if enabled { "Enable-NetAdapter" } else { "Disable-NetAdapter" };
+                let _ = powershell(&format!(
+                    "Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | \
+                     Where-Object {{ $_.InterfaceDescription -like '*TAP-Windows Adapter V9*' }} | \
+                     {verb} -Confirm:$false"
+                ))
+                .await;
             }
 
             /// Install OpenVPN's signed TAP-Windows driver + one TAP0901 adapter so
