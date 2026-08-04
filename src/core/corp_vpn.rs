@@ -763,15 +763,28 @@ exit 0
             }
 
             pub fn vpnc_script_body(dump: &Path) -> String {
-                // Windows Script Host (cscript) — dump the pushed config env vars.
-                // OpenConnect+wintun brings the adapter up itself; we only learn
-                // the split here and apply routes/DNS from Rust (below).
+                // Windows Script Host (cscript). On TAP-Windows OpenConnect does NOT
+                // configure the interface itself (unlike wintun) — it delegates that
+                // to this script, exactly like the macOS/Linux scripts do with
+                // ifconfig / `ip addr`. So we set the tunnel IP + MTU here via netsh
+                // (a /32 point-to-point address, matching the other platforms), then
+                // dump the pushed config for Rust to apply the routes/DNS split.
+                // Without the IP the TAP adapter falls back to a 169.254 APIPA
+                // address and no corp traffic flows.
                 let dump = dump.display().to_string().replace('\\', "\\\\");
                 format!(
                     r#"var sh = WScript.CreateObject("WScript.Shell");
 var env = sh.Environment("PROCESS");
 var reason = "" + env("reason");
 if (reason == "connect" || reason == "reconnect") {{
+  var tundev = "" + env("TUNDEV");
+  var addr = "" + env("INTERNAL_IP4_ADDRESS");
+  var mtu = "" + env("INTERNAL_IP4_MTU");
+  if (mtu == "" || mtu == "undefined") mtu = "1400";
+  if (tundev != "" && addr != "") {{
+    sh.Run('netsh interface ipv4 set address name="' + tundev + '" static ' + addr + ' 255.255.255.255', 0, true);
+    sh.Run('netsh interface ipv4 set subinterface "' + tundev + '" mtu=' + mtu + ' store=active', 0, true);
+  }}
   var fso = WScript.CreateObject("Scripting.FileSystemObject");
   var f = fso.CreateTextFile("{dump}", true);
   var e = new Enumerator(env);
