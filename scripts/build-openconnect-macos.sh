@@ -47,6 +47,13 @@ fetch https://www.gnupg.org/ftp/gcrypt/gnutls/v3.8/gnutls-3.8.10.tar.xz \
 fetch https://www.infradead.org/openconnect/download/openconnect-9.12.tar.gz \
   a2bedce3aa4dfe75e36e407e48e8e8bc91d46def5335ac9564fbf91bd4b2413e
 
+# vpnc-script, pinned: shipped in the bundle, and configure wants an executable
+# default (the service always passes its own --script).
+curl -fsSL --retry 3 -o "$work/vpnc-script" \
+  "https://gitlab.com/openconnect/vpnc-scripts/-/raw/ce9e961bd0f6b867e1c7c35f78f6fb973f6ff101/vpnc-script"
+echo "f0c4d936a382f07711263242699b5e2d85d1ace37136bb78785d352997c17742  $work/vpnc-script" | shasum -a 256 -c -
+chmod +x "$work/vpnc-script"
+
 echo "::group::gmp"
 (cd "$work/gmp-6.3.0" &&
   ./configure --prefix="$prefix" --disable-shared --enable-static --with-pic &&
@@ -81,6 +88,7 @@ echo "::group::openconnect"
     --with-gnutls --without-openssl \
     --without-stoken --without-libpskc --without-gssapi --without-libpcsclite \
     --without-libproxy --without-lz4 --disable-docs \
+    --with-vpnc-script="$work/vpnc-script" \
     PKG_CONFIG="pkg-config --static" \
     LIBXML2_CFLAGS="-I$sdk/usr/include/libxml2" LIBXML2_LIBS="-lxml2" \
     ZLIB_CFLAGS="" ZLIB_LIBS="-lz" &&
@@ -97,7 +105,5 @@ done
 [ -x "$out/openconnect" ] || { echo "FAIL: openconnect binary not installed"; exit 1; }
 strip -x "$out/openconnect"
 
-curl -fsSL --retry 3 -o "$out/vpnc-script" \
-  "https://gitlab.com/openconnect/vpnc-scripts/-/raw/ce9e961bd0f6b867e1c7c35f78f6fb973f6ff101/vpnc-script"
-echo "f0c4d936a382f07711263242699b5e2d85d1ace37136bb78785d352997c17742  $out/vpnc-script" | shasum -a 256 -c -
+cp "$work/vpnc-script" "$out/vpnc-script"
 chmod +x "$out/openconnect" "$out/vpnc-script"
