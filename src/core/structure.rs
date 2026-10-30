@@ -75,6 +75,18 @@ pub struct CorpVpnStatusData {
     /// Recent OpenConnect stderr lines (most recent last), for the UI log view.
     #[serde(default)]
     pub log_tail: Vec<String>,
+    /// With `needs_cert_trust`: why verification failed. `CERTIFICATE_CHANGED`
+    /// = the configured `--servercert` pin no longer matches (rotation or
+    /// interception); otherwise `CERTIFICATE_UNTRUSTED` / `_EXPIRED` /
+    /// `_HOSTNAME_MISMATCH` / `_INVALID` from OpenConnect's reason line.
+    #[serde(default)]
+    pub cert_error: String,
+    /// OpenConnect's verbatim "Reason:" text, when it printed one.
+    #[serde(default)]
+    pub cert_reason: String,
+    /// The pin that was configured and refused (only for `CERTIFICATE_CHANGED`).
+    #[serde(default)]
+    pub previous_servercert: String,
 }
 
 #[cfg(feature = "response")]
