@@ -13,106 +13,91 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish the component under"
+        description: "Release tag to publish under: a NEW tag (released apps pin published bundles by SHA-256)"
         required: true
-        default: components-openconnect-9.21
+      platforms:
+        description: "Which bundles to build and publish"
+        type: choice
+        options: [macos, all]
+        default: macos
+  pull_request:
+    paths:
+      - .github/workflows/publish-openconnect-component.yml
+      - scripts/build-openconnect-macos.sh
+      - scripts/verify-openconnect-macos.sh
 
 permissions:
   contents: write
 
 env:
-  COMPONENT_TAG: ${{ inputs.tag || 'components-openconnect-9.21' }}
+  COMPONENT_TAG: ${{ inputs.tag }}
 
 jobs:
   # --------------------------------------------------------------------- macOS
+  # Built from source (scripts/build-openconnect-macos.sh), not from Homebrew:
+  # bottles target the runner's macOS release, so a bundle made of them needed
+  # macOS 14 (arm64) / 15 (Intel) while the app runs on 12+. Runs on every PR
+  # that touches the recipe (build + verify, artifact only); publishes only from
+  # a manual run.
   macos:
-    runs-on: macos-14 # Apple silicon
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+            asset: openconnect-macos-arm64.tar.gz
+            title: macOS arm64
+          - runner: macos-15-intel
+            arch: x86_64
+            asset: openconnect-macos-amd64.tar.gz
+            title: macOS amd64 (Intel)
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
     steps:
       - uses: actions/checkout@v4
-      - name: Install openconnect + dylibbundler
-        run: brew install openconnect dylibbundler
-      - name: Assemble relocatable bundle
+      - name: Build tools
+        run: brew list pkgconf >/dev/null 2>&1 || brew install pkgconf
+      - name: Build OpenConnect (static, macOS ${{ env.MACOSX_DEPLOYMENT_TARGET }}+)
+        run: bash scripts/build-openconnect-macos.sh bundle
+      - name: Verify bundle
+        run: bash scripts/verify-openconnect-macos.sh bundle ${{ matrix.arch }}
+      - name: Package
         run: |
           set -euo pipefail
-          mkdir -p bundle/libs
-          if [ -x "$(brew --prefix openconnect)/sbin/openconnect" ]; then
-            cp "$(brew --prefix openconnect)/sbin/openconnect" bundle/openconnect
-          else
-            cp "$(brew --prefix openconnect)/bin/openconnect" bundle/openconnect
-          fi
-          chmod +x bundle/openconnect
-          curl -fsSL "https://gitlab.com/openconnect/vpnc-scripts/-/raw/master/vpnc-script" -o bundle/vpnc-script
-          chmod +x bundle/vpnc-script
-          dylibbundler -od -b -x ./bundle/openconnect -d ./bundle/libs -p @executable_path/libs
-          otool -L bundle/openconnect
-          if otool -L bundle/openconnect | grep -q "/opt/homebrew\|/usr/local/Cellar\|/usr/local/opt"; then
-            echo "FAIL: still references Homebrew — not relocatable"; exit 1
-          fi
-      - name: Package + hash + publish
+          tar -czf "${{ matrix.asset }}" -C bundle .
+          sha=$(shasum -a 256 "${{ matrix.asset }}" | awk '{print $1}')
+          echo "$sha  ${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          {
+            echo "### ${{ matrix.title }}"
+            echo "- \`${{ matrix.asset }}\` sha256 \`$sha\` ($(ls -lh "${{ matrix.asset }}" | awk '{print $5}'))"
+            echo "  BinRel: \`openconnect\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
+      - name: Publish
+        if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          asset="openconnect-macos-arm64.tar.gz"
-          tar -czf "$asset" -C bundle .
-          sha=$(shasum -a 256 "$asset" | awk '{print $1}')
-          echo "$sha  $asset" > "$asset.sha256"
-          {
-            echo "### macOS arm64"
-            echo "- \`$asset\` sha256 \`$sha\` ($(ls -lh "$asset" | awk '{print $5}'))"
-            echo "  BinRel: \`openconnect\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-          gh release view "$COMPONENT_TAG" >/dev/null 2>&1 || gh release create "$COMPONENT_TAG" \
-            --title "Components — OpenConnect ($COMPONENT_TAG)" \
-            --notes "On-demand OpenConnect bundles for the corporate-VPN feature. Not an app release." --prerelease
-          gh release upload "$COMPONENT_TAG" "$asset" "$asset.sha256" --clobber
-
-  # ---------------------------------------------------------------- macOS Intel
-  macos-intel:
-    runs-on: macos-15-intel # Intel (macos-13 is queue-starved / being retired)
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install openconnect + dylibbundler
-        run: brew install openconnect dylibbundler
-      - name: Assemble relocatable bundle
-        run: |
-          set -euo pipefail
-          mkdir -p bundle/libs
-          if [ -x "$(brew --prefix openconnect)/sbin/openconnect" ]; then
-            cp "$(brew --prefix openconnect)/sbin/openconnect" bundle/openconnect
-          else
-            cp "$(brew --prefix openconnect)/bin/openconnect" bundle/openconnect
+          asset="${{ matrix.asset }}"
+          gh release view "$COMPONENT_TAG" >/dev/null 2>&1 || gh release create "$COMPONENT_TAG"             --title "Components — OpenConnect ($COMPONENT_TAG)"             --notes "On-demand OpenConnect bundles for the corporate-VPN feature. Not an app release." --prerelease
+          if gh release view "$COMPONENT_TAG" --json assets -q '.assets[].name' | grep -qx "$asset"; then
+            echo "FAIL: $COMPONENT_TAG already has $asset. Released apps pin published bundles by SHA-256; publish under a new tag."; exit 1
           fi
-          chmod +x bundle/openconnect
-          curl -fsSL "https://gitlab.com/openconnect/vpnc-scripts/-/raw/master/vpnc-script" -o bundle/vpnc-script
-          chmod +x bundle/vpnc-script
-          dylibbundler -od -b -x ./bundle/openconnect -d ./bundle/libs -p @executable_path/libs
-          if otool -L bundle/openconnect | grep -q "/opt/homebrew\|/usr/local/Cellar\|/usr/local/opt"; then
-            echo "FAIL: still references Homebrew — not relocatable"; exit 1
-          fi
-      - name: Package + hash + publish
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          asset="openconnect-macos-amd64.tar.gz"
-          tar -czf "$asset" -C bundle .
-          sha=$(shasum -a 256 "$asset" | awk '{print $1}')
-          echo "$sha  $asset" > "$asset.sha256"
-          {
-            echo "### macOS amd64 (Intel)"
-            echo "- \`$asset\` sha256 \`$sha\` ($(ls -lh "$asset" | awk '{print $5}'))"
-            echo "  BinRel: \`openconnect\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-          gh release view "$COMPONENT_TAG" >/dev/null 2>&1 || gh release create "$COMPONENT_TAG" \
-            --title "Components — OpenConnect ($COMPONENT_TAG)" \
-            --notes "On-demand OpenConnect bundles for the corporate-VPN feature. Not an app release." --prerelease
-          gh release upload "$COMPONENT_TAG" "$asset" "$asset.sha256" --clobber
+          gh release upload "$COMPONENT_TAG" "$asset" "$asset.sha256"
 
   # ------------------------------------------------------------------- Windows
   # MSYS2 has no prebuilt openconnect, so build it from source (mingw) against the
   # MSYS2-provided crypto/xml deps, then bundle the exe + its DLLs + wintun.dll.
   windows:
+    if: github.event_name == 'workflow_dispatch' && inputs.platforms == 'all'
     runs-on: windows-latest
     defaults:
       run:
@@ -219,10 +204,14 @@ jobs:
           gh release view "$COMPONENT_TAG" >/dev/null 2>&1 || gh release create "$COMPONENT_TAG" \
             --title "Components — OpenConnect ($COMPONENT_TAG)" \
             --notes "On-demand OpenConnect bundles for the corporate-VPN feature. Not an app release." --prerelease
-          gh release upload "$COMPONENT_TAG" "$asset" "$asset.sha256" --clobber
+          if gh release view "$COMPONENT_TAG" --json assets -q '.assets[].name' | grep -qx "$asset"; then
+            echo "FAIL: $COMPONENT_TAG already has $asset. Released apps pin published bundles by SHA-256; publish under a new tag."; exit 1
+          fi
+          gh release upload "$COMPONENT_TAG" "$asset" "$asset.sha256"
 
   # --------------------------------------------------------------------- Linux
   linux:
+    if: github.event_name == 'workflow_dispatch' && inputs.platforms == 'all'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -263,13 +252,17 @@ jobs:
           gh release view "$COMPONENT_TAG" >/dev/null 2>&1 || gh release create "$COMPONENT_TAG" \
             --title "Components — OpenConnect ($COMPONENT_TAG)" \
             --notes "On-demand OpenConnect bundles for the corporate-VPN feature. Not an app release." --prerelease
-          gh release upload "$COMPONENT_TAG" "$asset" "$asset.sha256" --clobber
+          if gh release view "$COMPONENT_TAG" --json assets -q '.assets[].name' | grep -qx "$asset"; then
+            echo "FAIL: $COMPONENT_TAG already has $asset. Released apps pin published bundles by SHA-256; publish under a new tag."; exit 1
+          fi
+          gh release upload "$COMPONENT_TAG" "$asset" "$asset.sha256"
 
   # --------------------------------------------------------------- Linux arm64
   # Native arm64 runner (ubuntu-24.04-arm) so apt gives an arm64 openconnect; same
   # relocatable-bundle recipe as amd64. Ready for the Linux desktop backend (still
   # gated behind the unix-socket IPC wiring), so the bundle exists ahead of it.
   linux-arm64:
+    if: github.event_name == 'workflow_dispatch' && inputs.platforms == 'all'
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
@@ -308,4 +301,7 @@ jobs:
           gh release view "$COMPONENT_TAG" >/dev/null 2>&1 || gh release create "$COMPONENT_TAG" \
             --title "Components — OpenConnect ($COMPONENT_TAG)" \
             --notes "On-demand OpenConnect bundles for the corporate-VPN feature. Not an app release." --prerelease
-          gh release upload "$COMPONENT_TAG" "$asset" "$asset.sha256" --clobber
+          if gh release view "$COMPONENT_TAG" --json assets -q '.assets[].name' | grep -qx "$asset"; then
+            echo "FAIL: $COMPONENT_TAG already has $asset. Released apps pin published bundles by SHA-256; publish under a new tag."; exit 1
+          fi
+          gh release upload "$COMPONENT_TAG" "$asset" "$asset.sha256"
