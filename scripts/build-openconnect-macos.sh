@@ -25,7 +25,10 @@ jobs=$(sysctl -n hw.ncpu)
 
 export CFLAGS="-O2 -mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET"
 export CXXFLAGS=$CFLAGS
-export LDFLAGS="-mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET"
+# Our prefix first, so configure checks and links never resolve -lgmp & co to
+# a Homebrew copy in a default search path (/usr/local on Intel runners).
+export CPPFLAGS="-I$prefix/include"
+export LDFLAGS="-L$prefix/lib -mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET"
 # Only our own .pc files: a Homebrew one on the runner must never be picked up.
 export PKG_CONFIG_PATH=$prefix/lib/pkgconfig
 export PKG_CONFIG_LIBDIR=$prefix/lib/pkgconfig
@@ -91,9 +94,21 @@ echo "::group::openconnect"
     --with-vpnc-script="$work/vpnc-script" \
     PKG_CONFIG="pkg-config --static" \
     LIBXML2_CFLAGS="-I$sdk/usr/include/libxml2" LIBXML2_LIBS="-lxml2" \
-    ZLIB_CFLAGS="" ZLIB_LIBS="-lz" &&
+    ZLIB_CFLAGS="" ZLIB_LIBS="-lz" \
+    LDFLAGS="$LDFLAGS -Wl,-map,$work/openconnect.map" &&
   make -j"$jobs" && make install)
 echo "::endgroup::"
+
+# Prove the static libraries linked in are ours: the link map names the
+# archive every object came from.
+for lib in libgmp.a libnettle.a libhogweed.a libgnutls.a; do
+  if ! grep -qF "$prefix/lib/$lib" "$work/openconnect.map"; then
+    echo "FAIL: $lib was not linked from $prefix/lib"; exit 1
+  fi
+done
+if grep -E '/(usr/local|opt/homebrew)/' "$work/openconnect.map"; then
+  echo "FAIL: the link pulled in a Homebrew file"; exit 1
+fi
 
 mkdir -p "$out"
 for d in sbin bin; do
