@@ -125,6 +125,15 @@ pub fn parse_vpnc_env(dump: &str) -> CorpSplit {
 /// the hex branch would otherwise try (and fail) to parse.
 #[allow(dead_code)]
 pub fn extract_servercert_pin(stderr: &str) -> Option<String> {
+    extract_servercert_pin_except(stderr, "")
+}
+
+/// Like [`extract_servercert_pin`], but never returns `skip` (the pin we passed
+/// in), so the configured pin can't be mistaken for the observed one.
+#[allow(dead_code)]
+fn extract_servercert_pin_except(stderr: &str, skip: &str) -> Option<String> {
+    let skip = skip.trim();
+    let pick = |p: String| (skip.is_empty() || p != skip).then_some(p);
     for line in stderr.lines() {
         let lower = line.to_ascii_lowercase();
         // GnuTLS: `pin-sha256:<base64>` (e.g. `pin-sha256:MCDJ...FCI=`).
@@ -135,20 +144,136 @@ pub fn extract_servercert_pin(stderr: &str) -> Option<String> {
                 .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
                 .collect();
             // A 32-byte SHA-256 digest is 44 base64 chars incl. the '=' pad.
-            if b64.len() >= 43 {
-                return Some(format!("pin-sha256:{b64}"));
+            if b64.len() >= 43
+                && let Some(p) = pick(format!("pin-sha256:{b64}"))
+            {
+                return Some(p);
             }
+            continue;
         }
         // OpenSSL: `sha256:<hex>`.
         if let Some(idx) = lower.find("sha256:") {
             let rest = &line[idx + "sha256:".len()..];
             let hex: String = rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
-            if hex.len() >= 32 {
-                return Some(format!("sha256:{hex}"));
+            if hex.len() >= 32
+                && let Some(p) = pick(format!("sha256:{hex}"))
+            {
+                return Some(p);
             }
         }
     }
     None
+}
+
+/// A certificate-verification failure OpenConnect reported before auth.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertTrust {
+    /// Observed server pin, in the backend's `--servercert` form.
+    pub pin: String,
+    /// `CERTIFICATE_CHANGED` / `_UNTRUSTED` / `_EXPIRED` / `_HOSTNAME_MISMATCH` / `_INVALID`.
+    pub error: &'static str,
+    pub reason: String,
+}
+
+/// classify_cert_failure recognizes a certificate refusal in OpenConnect's
+/// stderr. With a pin configured, OpenConnect accepts ONLY that pin (pinning
+/// bypasses CA validation) and on mismatch prints "None of the N fingerprint(s)
+/// specified via --servercert match server's certificate: <pin>" — that is a
+/// certificate change, surfaced so the user can re-approve explicitly. Without
+/// a pin, the CA check failed and the "Reason:" line says why. Pure.
+#[allow(dead_code)]
+pub fn classify_cert_failure(stderr: &str, configured: &str) -> Option<CertTrust> {
+    let configured = configured.trim();
+    let lower = stderr.to_ascii_lowercase();
+    let pin = extract_servercert_pin_except(stderr, configured)?;
+    if !configured.is_empty() {
+        if lower.contains("specified via --servercert match") {
+            return Some(CertTrust {
+                pin,
+                error: "CERTIFICATE_CHANGED",
+                reason: String::new(),
+            });
+        }
+        return None;
+    }
+    if !(lower.contains("failed verification") || lower.contains("certificate verify failed")) {
+        // Old behaviour: any printed pin without a configured one = trust prompt.
+        return Some(CertTrust {
+            pin,
+            error: "CERTIFICATE_UNTRUSTED",
+            reason: String::new(),
+        });
+    }
+    let reason = stderr
+        .lines()
+        .find_map(|l| {
+            let t = l.trim();
+            t.get(..7)
+                .filter(|p| p.eq_ignore_ascii_case("reason:"))
+                .map(|_| t[7..].trim().to_string())
+        })
+        .unwrap_or_default();
+    let r = reason.to_ascii_lowercase();
+    let error = if r.is_empty() {
+        "CERTIFICATE_UNTRUSTED"
+    } else if r.contains("expired")
+        || r.contains("not yet activated")
+        || r.contains("not yet valid")
+    {
+        "CERTIFICATE_EXPIRED"
+    } else if r.contains("hostname") || r.contains("host name") {
+        "CERTIFICATE_HOSTNAME_MISMATCH"
+    } else if r.contains("signer not found")
+        || r.contains("not a ca")
+        || r.contains("issuer")
+        || r.contains("self-signed")
+        || r.contains("self signed")
+    {
+        "CERTIFICATE_UNTRUSTED"
+    } else {
+        "CERTIFICATE_INVALID"
+    };
+    Some(CertTrust { pin, error, reason })
+}
+
+/// openconnect_args builds OpenConnect's argv (minus the program). `--servercert`
+/// is added ONLY for a non-blank pin: no pin = OpenConnect's normal CA
+/// validation, never a fallback pin. Pure — unit-tested.
+#[allow(dead_code)]
+pub fn openconnect_args(
+    req: &CorpVpnStartRequest,
+    script: &std::path::Path,
+    extra: Vec<String>,
+) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "--script".into(),
+        script.as_os_str().to_owned(),
+        "--user".into(),
+        req.username.clone().into(),
+        "--passwd-on-stdin".into(),
+        "--non-inter".into(),
+    ];
+    args.extend(extra.into_iter().map(Into::into));
+    let pin = req.servercert.trim();
+    if !pin.is_empty() {
+        args.push("--servercert".into());
+        args.push(pin.into());
+    }
+    args.push(req.gateway.clone().into());
+    args
+}
+
+/// Last ~`max` bytes of `s`, cut on a char boundary (OpenConnect output can be
+/// localized / non-ASCII; slicing mid-char would panic).
+#[allow(dead_code)]
+fn tail_chars(s: &str, max: usize) -> String {
+    let t = s.trim();
+    let mut start = t.len().saturating_sub(max);
+    while !t.is_char_boundary(start) {
+        start += 1;
+    }
+    t[start..].to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -224,19 +349,20 @@ mod imp {
         platform::make_executable(&wrapper).await;
 
         let mut cmd = tokio::process::Command::new(&bin);
-        cmd.arg("--script")
-            .arg(&wrapper)
-            .arg("--user")
-            .arg(&req.username)
-            .arg("--passwd-on-stdin")
-            .arg("--non-inter");
-        for a in platform::openconnect_extra_args() {
-            cmd.arg(a);
-        }
-        if !req.servercert.trim().is_empty() {
-            cmd.arg("--servercert").arg(req.servercert.trim());
-        }
-        cmd.arg(&req.gateway);
+        cmd.args(openconnect_args(
+            &req,
+            &wrapper,
+            platform::openconnect_extra_args(),
+        ));
+        tracing::info!(
+            "corp-vpn: starting openconnect for {} (servercert pin: {})",
+            req.gateway,
+            if req.servercert.trim().is_empty() {
+                "none, CA validation"
+            } else {
+                req.servercert.trim()
+            }
+        );
         cmd.stdin(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         // If this future is dropped (client disconnect, handler-timeout, supersede)
@@ -290,7 +416,7 @@ mod imp {
                     full_tunnel: split.full_tunnel,
                     tundev: split.tundev,
                     gateway_ip: split.gateway_ip,
-                    log_tail: Vec::new(),
+                    ..Default::default()
                 };
                 let mut st = STATE.lock().await;
                 st.child = Some(child);
@@ -308,13 +434,29 @@ mod imp {
                 tokio::time::sleep(Duration::from_millis(120)).await;
                 let stderr = collected_logs().await;
                 let _ = exit;
-                if req.servercert.trim().is_empty()
-                    && let Some(pin) = extract_servercert_pin(&stderr)
-                {
+                if let Some(ct) = classify_cert_failure(&stderr, &req.servercert) {
+                    tracing::warn!(
+                        "corp-vpn: certificate refused before auth: {} (configured pin: {}, server pin: {})",
+                        ct.error,
+                        if req.servercert.trim().is_empty() {
+                            "none"
+                        } else {
+                            req.servercert.trim()
+                        },
+                        ct.pin
+                    );
+                    let previous = if ct.error == "CERTIFICATE_CHANGED" {
+                        req.servercert.trim().to_string()
+                    } else {
+                        String::new()
+                    };
                     return Ok(CorpVpnStatusData {
                         connected: false,
                         needs_cert_trust: true,
-                        servercert_sha256: pin,
+                        servercert_sha256: ct.pin,
+                        cert_error: ct.error.to_string(),
+                        cert_reason: ct.reason,
+                        previous_servercert: previous,
                         ..Default::default()
                     });
                 }
@@ -381,9 +523,7 @@ mod imp {
     }
 
     fn tail(s: &str) -> String {
-        let t = s.trim();
-        let start = t.len().saturating_sub(400);
-        t[start..].to_string()
+        tail_chars(s, 400)
     }
 
     // =======================================================================
@@ -881,7 +1021,11 @@ WScript.Quit(0);
             /// corp's persistent adapter is down (no stale IP/route) whenever corp
             /// is off — otherwise it can disturb mihomo's wintun bring-up.
             pub async fn set_tap_enabled(enabled: bool) {
-                let verb = if enabled { "Enable-NetAdapter" } else { "Disable-NetAdapter" };
+                let verb = if enabled {
+                    "Enable-NetAdapter"
+                } else {
+                    "Disable-NetAdapter"
+                };
                 let _ = powershell(&format!(
                     "Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | \
                      Where-Object {{ $_.InterfaceDescription -like '*TAP-Windows Adapter V9*' }} | \
@@ -1157,11 +1301,111 @@ CISCO_SPLIT_DNS=corp.example,sub.corp.example
         // Real line shape from a self-signed corp gateway.
         let stderr = "Certificate from VPN server \"vpn.example\" failed verification.\nReason: signer not found\nTo trust this server in future, perhaps add this to your command line:\n    --servercert pin-sha256:MCDJgwuGvXvv80C45Q2mYbX4C334x7+82GyRERoyFCI= to trust\n";
         let pin = extract_servercert_pin(stderr).expect("should find a base64 pin");
-        assert_eq!(pin, "pin-sha256:MCDJgwuGvXvv80C45Q2mYbX4C334x7+82GyRERoyFCI=");
+        assert_eq!(
+            pin,
+            "pin-sha256:MCDJgwuGvXvv80C45Q2mYbX4C334x7+82GyRERoyFCI="
+        );
     }
 
     #[test]
     fn no_servercert_pin_when_absent() {
         assert!(extract_servercert_pin("all good, connected\n").is_none());
+    }
+
+    const OLD_PIN: &str = "pin-sha256:MCDJgwuGvXvv80C45Q2mYbX4C334x7+82GyRERoyFCI=";
+    const NEW_PIN: &str = "pin-sha256:zaTdo6UzzBdQ8q9j/dX1wPikc0LbMPI93JrWPkUXHGw=";
+    // Real stderr after the gateway renewed its certificate (stale pin passed).
+    const ROTATION_STDERR: &str = "None of the 1 fingerprint(s) specified via --servercert match server's certificate: pin-sha256:zaTdo6UzzBdQ8q9j/dX1wPikc0LbMPI93JrWPkUXHGw=\nSSL connection failure: Error in the certificate.\nFailed to open HTTPS connection to vpn.skoltech.ru\n";
+
+    fn req(pin: &str) -> CorpVpnStartRequest {
+        CorpVpnStartRequest {
+            bin_path: "openconnect".into(),
+            gateway: "vpn.corp.test".into(),
+            username: "alice".into(),
+            password: "hunter2".into(),
+            servercert: pin.into(),
+        }
+    }
+
+    #[test]
+    fn no_servercert_arg_without_a_pin() {
+        for pin in ["", "   "] {
+            let args = openconnect_args(&req(pin), std::path::Path::new("s.sh"), vec![]);
+            assert!(
+                !args
+                    .iter()
+                    .any(|a| a.to_string_lossy().contains("servercert")),
+                "pin {pin:?} must not add --servercert: {args:?}"
+            );
+            assert_eq!(args.last().unwrap(), "vpn.corp.test");
+        }
+    }
+
+    #[test]
+    fn servercert_arg_with_a_pin_and_password_never_in_argv() {
+        let args = openconnect_args(&req(NEW_PIN), std::path::Path::new("s.sh"), vec![]);
+        let pos = args
+            .iter()
+            .position(|a| a == "--servercert")
+            .expect("--servercert");
+        assert_eq!(args[pos + 1], NEW_PIN);
+        assert!(!args.iter().any(|a| a.to_string_lossy().contains("hunter2")));
+    }
+
+    #[test]
+    fn stale_pin_is_certificate_changed() {
+        let ct = classify_cert_failure(ROTATION_STDERR, OLD_PIN).expect("cert failure");
+        assert_eq!(ct.error, "CERTIFICATE_CHANGED");
+        assert_eq!(ct.pin, NEW_PIN);
+    }
+
+    #[test]
+    fn mismatch_never_returns_the_configured_pin() {
+        // If OpenConnect ever echoed our own pin, it must not come back as "new".
+        let stderr = format!("{ROTATION_STDERR}configured {OLD_PIN}\n");
+        assert_eq!(
+            classify_cert_failure(&stderr, OLD_PIN).unwrap().pin,
+            NEW_PIN
+        );
+        let only_ours = format!(
+            "None of the 1 fingerprint(s) specified via --servercert match server's certificate: {OLD_PIN}\n"
+        );
+        assert!(classify_cert_failure(&only_ours, OLD_PIN).is_none());
+    }
+
+    #[test]
+    fn pinned_non_cert_failure_is_not_a_trust_prompt() {
+        let stderr = "Got HTTP response: HTTP/1.1 401 Unauthorized\nLogin failed.\n";
+        assert!(classify_cert_failure(stderr, NEW_PIN).is_none());
+    }
+
+    #[test]
+    fn first_use_reasons_are_classified() {
+        for (reason, want) in [
+            ("signer not found", "CERTIFICATE_UNTRUSTED"),
+            (
+                "certificate does not match hostname",
+                "CERTIFICATE_HOSTNAME_MISMATCH",
+            ),
+            ("certificate expired", "CERTIFICATE_EXPIRED"),
+            ("insecure algorithm", "CERTIFICATE_INVALID"),
+        ] {
+            let stderr = format!(
+                "Certificate from VPN server \"vpn.corp.test\" failed verification.\nReason: {reason}\nTo trust this server in future, perhaps add this to your command line:\n    --servercert {NEW_PIN}\n"
+            );
+            let ct = classify_cert_failure(&stderr, "").expect("cert failure");
+            assert_eq!(
+                (ct.error, ct.reason.as_str(), ct.pin.as_str()),
+                (want, reason, NEW_PIN)
+            );
+        }
+    }
+
+    #[test]
+    fn tail_is_char_boundary_safe() {
+        let s = format!("{}{}", "ж".repeat(300), "end");
+        let t = tail_chars(&s, 400);
+        assert!(t.ends_with("end"));
+        assert!(t.len() <= 400);
     }
 }
