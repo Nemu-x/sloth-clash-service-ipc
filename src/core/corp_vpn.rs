@@ -1298,12 +1298,12 @@ CISCO_SPLIT_DNS=corp.example,sub.corp.example
     #[test]
     fn extracts_gnutls_base64_pin() {
         // GnuTLS builds (our Windows bundle) print the base64 `pin-sha256:` form.
-        // Real line shape from a self-signed corp gateway.
-        let stderr = "Certificate from VPN server \"vpn.example\" failed verification.\nReason: signer not found\nTo trust this server in future, perhaps add this to your command line:\n    --servercert pin-sha256:MCDJgwuGvXvv80C45Q2mYbX4C334x7+82GyRERoyFCI= to trust\n";
+        // Line shape from a self-signed corp gateway (synthetic pin).
+        let stderr = "Certificate from VPN server \"vpn.example\" failed verification.\nReason: signer not found\nTo trust this server in future, perhaps add this to your command line:\n    --servercert pin-sha256:apo83jtNjY9S5BMu0+FgmRInhoUIg9NYm/9Rw6ePuWg= to trust\n";
         let pin = extract_servercert_pin(stderr).expect("should find a base64 pin");
         assert_eq!(
             pin,
-            "pin-sha256:MCDJgwuGvXvv80C45Q2mYbX4C334x7+82GyRERoyFCI="
+            "pin-sha256:apo83jtNjY9S5BMu0+FgmRInhoUIg9NYm/9Rw6ePuWg="
         );
     }
 
@@ -1312,10 +1312,10 @@ CISCO_SPLIT_DNS=corp.example,sub.corp.example
         assert!(extract_servercert_pin("all good, connected\n").is_none());
     }
 
-    const OLD_PIN: &str = "pin-sha256:MCDJgwuGvXvv80C45Q2mYbX4C334x7+82GyRERoyFCI=";
-    const NEW_PIN: &str = "pin-sha256:zaTdo6UzzBdQ8q9j/dX1wPikc0LbMPI93JrWPkUXHGw=";
-    // Real stderr after the gateway renewed its certificate (stale pin passed).
-    const ROTATION_STDERR: &str = "None of the 1 fingerprint(s) specified via --servercert match server's certificate: pin-sha256:zaTdo6UzzBdQ8q9j/dX1wPikc0LbMPI93JrWPkUXHGw=\nSSL connection failure: Error in the certificate.\nFailed to open HTTPS connection to vpn.skoltech.ru\n";
+    const OLD_PIN: &str = "pin-sha256:apo83jtNjY9S5BMu0+FgmRInhoUIg9NYm/9Rw6ePuWg=";
+    const NEW_PIN: &str = "pin-sha256:e1DdhZfjxnW9MJzTBCrO5jSPUZOHQ00seIF/h4cdmkA=";
+    // Stderr shape after a gateway renewed its certificate (stale pin passed).
+    const ROTATION_STDERR: &str = "None of the 1 fingerprint(s) specified via --servercert match server's certificate: pin-sha256:e1DdhZfjxnW9MJzTBCrO5jSPUZOHQ00seIF/h4cdmkA=\nSSL connection failure: Error in the certificate.\nFailed to open HTTPS connection to vpn.corp.test\n";
 
     fn req(pin: &str) -> CorpVpnStartRequest {
         CorpVpnStartRequest {
